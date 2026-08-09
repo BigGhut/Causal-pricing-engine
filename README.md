@@ -4,16 +4,16 @@ Causal Pricing Engine (CPE) is a **Causal ML & Uplift Modeling** microservice de
 
 ---
 
-## Why Not Classic ML?
+## Почему не классический ML?
 
-Classic supervised machine learning models predict baseline conversion rate $P(Y=1 \mid X, T)$, which fails to separate users who convert regardless of incentives from those whose behavior is genuinely shifted by the intervention.
+Классические модели supervised learning оценивают уровень конверсии $P(Y=1 \mid X, T)$. Они не отделяют тех, кто конвертируется **и без** стимула, от тех, чьё поведение **реально меняется** из‑за воздействия (скидка, surge и т.п.).
 
-Uplift modeling directly estimates the Individual Treatment Effect (ITE):
+Uplift-моделирование напрямую оценивает **индивидуальный эффект воздействия (ITE)**:
 $$\tau(x) = \mathbb{E}[Y^{(1)} - Y^{(0)} \mid X = x]$$
 
-Where $Y^{(1)}$ is the outcome under treatment (e.g. discount or surge bonus), $Y^{(0)}$ is the baseline outcome under control, and $\tau(x)$ represents the net incremental gain attributable strictly to the treatment.
+где $Y^{(1)}$ — исход при treatment (например, скидка или surge-надбавка), $Y^{(0)}$ — исход без воздействия (control), а $\tau(x)$ — **чистый прирост**, который можно отнести именно к treatment.
 
-> **Disclaimer & Scope**: The default demo uses synthetic data with **seeded HTE** to demonstrate pipeline mechanics & policy rules rather than claiming production city-scale lift. Qini coefficients are **normalized** ($\approx [-1, 1]$, random null $\approx 0$). DPE simulation logs represent observational data with potential post-treatment feature entanglement (see `CASE_STUDY.md`).
+> **Оговорки и границы claim.** Дефолтное демо использует **синтетику с заложенным HTE**: оно показывает механику пайплайна и правила политики, а **не** city-scale lift в проде. Коэффициент Qini — **нормализованный** ($\approx [-1, 1]$, random null $\approx 0$). Логи симуляции DPE — observational / switchback-данные с возможным post-treatment entanglement признаков (см. `CASE_STUDY.md`).
 
 ---
 
