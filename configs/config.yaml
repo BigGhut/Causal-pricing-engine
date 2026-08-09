@@ -1,0 +1,20 @@
+model:
+  base_learner: logistic_regression  # logistic_regression | gradient_boosting | catboost
+  n_estimators: 100
+  learning_rate: 0.1
+  random_state: 42
+
+experiment:
+  alpha: 0.05
+  power: 0.80
+  mde: 0.02
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  model_path: "artifacts/model.joblib"
+  uplift_threshold: 0.05
+
+data:
+  n_samples: 5000
+  random_state: 42

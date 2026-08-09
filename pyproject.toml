@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-pricing-engine"
+version = "0.1.0"
+description = "Causal ML & Uplift Modeling Engine for Dynamic Pricing and Experimentation"
+authors = [{ name = "Author" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "catboost>=1.2.0",
+    "lightgbm>=4.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pyyaml>=6.0",
+    "joblib>=1.3.0",
+    "scipy>=1.11.0",
+    "econml>=0.14.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "httpx>=0.24.0", "ruff>=0.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
