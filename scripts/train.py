@@ -110,13 +110,10 @@ def train_and_select(random_state: int | None = None) -> dict:
     print(f"  dml: Qini AUC={dml_qini:.4f}, Uplift@k={dml_uk:.4f}")
     candidates["dml"] = dml
 
-    # Select best by Qini AUC among meta-learners that implement predict_uplift
-    meta_scores = {
-        k: v["qini_auc"]
-        for k, v in results.items()
-        if k != "dml" and hasattr(candidates[k], "predict_uplift")
-    }
-    best_name = max(meta_scores, key=meta_scores.get)  # type: ignore[arg-type]
+    # Select best by Qini AUC among ALL candidates (T/S/X-Learner + DML).
+    # API score_uplift already supports both predict_uplift and effect().
+    scores = {k: v["qini_auc"] for k, v in results.items()}
+    best_name = max(scores, key=scores.get)  # type: ignore[arg-type]
     best_model = candidates[best_name]
 
     artifacts_dir = _ROOT / "artifacts"

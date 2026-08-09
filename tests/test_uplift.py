@@ -357,3 +357,47 @@ def test_package_exports():
     assert BaseUpliftModel is not None
     assert DMLEngine is not None
     assert callable(qini_auc_score)
+
+
+def test_train_selects_best_among_all_candidates_including_dml(monkeypatch, tmp_path):
+    """Shipped train_and_select must pick max Qini across T/S/X + DML (not exclude DML)."""
+    import scripts.train as train_mod
+    from src.config import AppConfig, ApiConfig, DataConfig, ExperimentConfig, ModelConfig
+
+    # Faster run: small n; write artifact into tmp so we don't clobber only via real path
+    small_cfg = AppConfig(
+        model=ModelConfig(base_learner="logistic_regression", n_estimators=20, random_state=0),
+        experiment=ExperimentConfig(),
+        api=ApiConfig(model_path=str(tmp_path / "model.joblib"), uplift_threshold=0.05),
+        data=DataConfig(n_samples=600, random_state=0),
+    )
+    monkeypatch.setattr(train_mod, "load_config", lambda path=None: small_cfg)
+    monkeypatch.setattr(train_mod, "_ROOT", tmp_path)
+
+    result = train_mod.train_and_select(random_state=0)
+
+    metrics = result["metrics"]
+    assert set(metrics.keys()) >= {"t_learner", "s_learner", "x_learner", "dml"}
+
+    expected_best = max(metrics, key=lambda k: metrics[k]["qini_auc"])
+    assert result["best_name"] == expected_best, (
+        f"best_name={result['best_name']} but max Qini is {expected_best} "
+        f"({ {k: v['qini_auc'] for k, v in metrics.items()} })"
+    )
+
+    artifact = Path(result["model_path"])
+    assert artifact.exists() and artifact.stat().st_size > 0
+    payload = joblib.load(artifact)
+    assert payload["model_name"] == expected_best
+    assert payload["model"] is not None
+
+    # API scoring path must work for whichever won (predict_uplift or effect)
+    from src.api.main import apply_model_payload, score_uplift, _MODEL_STATE
+
+    apply_model_payload(payload)
+    features = {c: 1.0 for c in FEATURE_COLUMNS}
+    features["price_sensitivity"] = 0.9
+    features["segment"] = 2.0
+    score = score_uplift(features)
+    assert np.isfinite(score)
+    _MODEL_STATE["model"] = None
