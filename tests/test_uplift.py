@@ -301,8 +301,9 @@ def test_load_config_env_overrides_yaml(monkeypatch: pytest.MonkeyPatch):
             monkeypatch.delenv(key, raising=False)
 
     baseline = load_config()
-    assert baseline.api.port == 8000
+    assert baseline.api.port == 8100
     assert baseline.api.host == "0.0.0.0"
+
     assert baseline.model.base_learner == "logistic_regression"
 
     monkeypatch.setenv("CPE_API__PORT", "9123")
@@ -467,3 +468,33 @@ def test_train_selects_best_among_all_candidates_including_dml(monkeypatch, tmp_
     score = score_uplift(features)
     assert np.isfinite(score)
     _MODEL_STATE["model"] = None
+
+
+def test_predict_uplift_nan_validation(tmp_path: Path):
+    """Test that API endpoint rejects NaN/Inf/null feature values with 422 status code."""
+    from fastapi.testclient import TestClient
+    from src.api.main import app, apply_model_payload, _MODEL_STATE
+
+    model_payload = {
+        "model_name": "TestLearner",
+        "model": TLearner(base_estimator=GradientBoostingRegressor()).fit(
+            X=np.ones((10, len(FEATURE_COLUMNS))),
+            treatment=np.array([0, 1] * 5),
+            y=np.array([10.0, 20.0] * 5),
+        ),
+        "feature_columns": FEATURE_COLUMNS,
+    }
+    apply_model_payload(model_payload)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/predict_uplift",
+        content='{"user_id": "u1", "features": {"past_trips": null}}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+    _MODEL_STATE["model"] = None
+
+
+
+

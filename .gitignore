@@ -52,3 +52,5 @@ artifacts/*.pkl
 
 # Logs
 *.log
+.worker_prompt_phase*.txt
+

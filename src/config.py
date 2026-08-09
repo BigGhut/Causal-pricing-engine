@@ -11,7 +11,7 @@ Nested delimiter: ``__``
 Examples (override YAML / field defaults)::
 
     CPE_API__HOST=127.0.0.1
-    CPE_API__PORT=9000
+    CPE_API__PORT=8100
     CPE_MODEL__BASE_LEARNER=gradient_boosting
     CPE_MODEL__N_ESTIMATORS=50
     CPE_MODEL__LEARNING_RATE=0.05
@@ -55,7 +55,7 @@ class ApiConfig(BaseModel):
     """FastAPI service settings."""
 
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8100
     model_path: str = "artifacts/model.joblib"
     uplift_threshold: float = 0.05
 
@@ -67,11 +67,17 @@ class DataConfig(BaseModel):
     random_state: int = 42
 
 
+class DpeConfig(BaseModel):
+    """DPE connector and database settings."""
+
+    db_path: str = "Z:/pet-project/dynamic-pricing-engine/dpe_database.db"
+
+
 class AppConfig(BaseSettings):
     """Root application configuration (pydantic-settings ``BaseSettings``).
 
     Nested sections are overridable via env vars with prefix ``CPE_`` and
-    delimiter ``__`` (e.g. ``CPE_API__PORT=9000``).
+    delimiter ``__`` (e.g. ``CPE_API__PORT=8100``).
     """
 
     model_config = SettingsConfigDict(
@@ -85,6 +91,7 @@ class AppConfig(BaseSettings):
     experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     data: DataConfig = Field(default_factory=DataConfig)
+    dpe: DpeConfig = Field(default_factory=DpeConfig)
 
 
 def _default_config_path() -> Path:
@@ -119,8 +126,6 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             dotenv_settings: PydanticBaseSettingsSource,
             file_secret_settings: PydanticBaseSettingsSource,
         ) -> tuple[PydanticBaseSettingsSource, ...]:
-            # Priority (first wins): init kwargs > env > YAML file > secrets.
-            # Callers rarely pass init; env must beat YAML so CPE_* overrides work.
             yaml_source = YamlConfigSettingsSource(
                 settings_cls,
                 yaml_file=config_path if config_path.exists() else None,

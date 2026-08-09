@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -12,13 +13,14 @@ if str(_ROOT) not in sys.path:
 
 import joblib
 import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
 from src.causal.dml_engine import DMLEngine
 from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearner
 from src.config import load_config
+from src.data.dpe_connector import DPE_FEATURE_COLUMNS, load_dpe_data
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
 from src.evaluation.metrics import qini_auc_score, uplift_at_k
 
@@ -55,8 +57,17 @@ def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, ra
     return LogisticRegression(max_iter=1000, random_state=random_state)
 
 
-def train_and_select(random_state: int | None = None) -> dict:
-    """Generate data, train candidates, pick best by Qini AUC, dump artifact.
+def train_and_select(
+    source: str = "synthetic",
+    dpe_db_path: str | Path | None = None,
+    random_state: int | None = None,
+) -> dict:
+    """Generate or load data, train candidates, pick best by Qini AUC, dump artifact.
+
+    Args:
+        source: Data source type ("synthetic" or "dpe").
+        dpe_db_path: Optional custom path to DPE SQLite database.
+        random_state: Random state seed.
 
     Returns:
         Dict with metrics and paths for programmatic checks.
@@ -64,10 +75,17 @@ def train_and_select(random_state: int | None = None) -> dict:
     cfg = load_config()
     rs = random_state if random_state is not None else cfg.data.random_state
 
-    print(f"Generating synthetic uplift dataset (n={cfg.data.n_samples})...")
-    df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=rs)
+    source_clean = source.lower()
+    if source_clean == "dpe":
+        print("Loading DPE simulation dataset...")
+        df = load_dpe_data(db_path=dpe_db_path)
+        feature_cols = DPE_FEATURE_COLUMNS
+    else:
+        print(f"Generating synthetic uplift dataset (n={cfg.data.n_samples})...")
+        df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=rs)
+        feature_cols = FEATURE_COLUMNS
 
-    X = df[FEATURE_COLUMNS].to_numpy(dtype=float)
+    X = df[feature_cols].to_numpy(dtype=float)
     y = df["conversion"].to_numpy(dtype=int)
     treatment = df["treatment"].to_numpy(dtype=int)
 
@@ -110,8 +128,7 @@ def train_and_select(random_state: int | None = None) -> dict:
     print(f"  dml: Qini AUC={dml_qini:.4f}, Uplift@k={dml_uk:.4f}")
     candidates["dml"] = dml
 
-    # Select best by Qini AUC among ALL candidates (T/S/X-Learner + DML).
-    # API score_uplift already supports both predict_uplift and effect().
+    # Select best by Qini AUC among ALL candidates
     scores = {k: v["qini_auc"] for k, v in results.items()}
     best_name = max(scores, key=scores.get)  # type: ignore[arg-type]
     best_model = candidates[best_name]
@@ -123,7 +140,8 @@ def train_and_select(random_state: int | None = None) -> dict:
     payload = {
         "model": best_model,
         "model_name": best_name,
-        "feature_columns": FEATURE_COLUMNS,
+        "feature_columns": feature_cols,
+        "source": source_clean,
         "metrics": results[best_name],
         "all_metrics": results,
         "uplift_threshold": cfg.api.uplift_threshold,
@@ -131,10 +149,11 @@ def train_and_select(random_state: int | None = None) -> dict:
     joblib.dump(payload, model_path)
 
     print("\n=== Training complete ===")
-    print(f"Best model: {best_name}")
-    print(f"Qini AUC:   {results[best_name]['qini_auc']:.4f}")
-    print(f"Uplift@k:   {results[best_name]['uplift_at_k']:.4f}")
-    print(f"Saved to:   {model_path}")
+    print(f"Data source: {source_clean}")
+    print(f"Best model:  {best_name}")
+    print(f"Qini AUC:    {results[best_name]['qini_auc']:.4f}")
+    print(f"Uplift@k:    {results[best_name]['uplift_at_k']:.4f}")
+    print(f"Saved to:    {model_path}")
 
     return {
         "best_name": best_name,
@@ -144,7 +163,22 @@ def train_and_select(random_state: int | None = None) -> dict:
 
 
 def main() -> None:
-    train_and_select()
+    parser = argparse.ArgumentParser(description="Train uplift models and save artifact.")
+    parser.add_argument(
+        "--source",
+        choices=["synthetic", "dpe"],
+        default="synthetic",
+        help="Data source: synthetic (default) or dpe (DPE SQLite DB)",
+    )
+    parser.add_argument(
+        "--dpe-db-path",
+        type=str,
+        default=None,
+        help="Optional custom path to dpe_database.db",
+    )
+    args = parser.parse_args()
+
+    train_and_select(source=args.source, dpe_db_path=args.dpe_db_path)
 
 
 if __name__ == "__main__":

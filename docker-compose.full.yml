@@ -1,0 +1,26 @@
+services:
+  causal-engine:
+    build: .
+    ports:
+      - "8100:8100"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CPE_API__PORT=8100
+      - CPE_DPE__DB_PATH=/app/data/dpe_database.db
+      - CPE_RETRAIN_ON_START=1
+    volumes:
+      - ../dynamic-pricing-engine/dpe_database.db:/app/data/dpe_database.db:ro
+    restart: unless-stopped
+
+  dpe-api:
+    build: ../dynamic-pricing-engine
+    ports:
+      - "8000:8000"
+    depends_on:
+      - causal-engine
+    environment:
+      - CAUSAL_ENGINE_URL=http://causal-engine:8100
+      - CAUSAL_ENABLED=true
+      - CAUSAL_ENGINE_TIMEOUT_SEC=0.1
+      - CAUSAL_UPLIFT_THRESHOLD=0.05
+    restart: unless-stopped

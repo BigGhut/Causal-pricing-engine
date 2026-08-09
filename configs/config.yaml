@@ -11,10 +11,14 @@ experiment:
 
 api:
   host: "0.0.0.0"
-  port: 8000
+  port: 8100
   model_path: "artifacts/model.joblib"
   uplift_threshold: 0.05
 
 data:
   n_samples: 5000
   random_state: 42
+
+dpe:
+  db_path: "Z:/pet-project/dynamic-pricing-engine/dpe_database.db"
+

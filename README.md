@@ -84,4 +84,85 @@ pip install -r requirements.txt
 
 # 3. Запуск тестов
 pytest tests/
+
 ```
+
+---
+
+## 🚀 Phase 3–4 Integration & Deployment
+
+### Сервисы и Порты
+- **Dynamic Pricing Engine (DPE):** `http://localhost:8000`
+- **Causal Pricing Engine (CPE):** `http://localhost:8100`
+
+### Быстрый старт & Команды (Makefile)
+```bash
+# Обучение модели на реальной БД DPE
+make train-dpe
+
+# Запуск CUPED / Switchback оценки эксперимента на DPE данных
+make evaluate
+
+# Запуск API сервиса CPE
+make serve
+
+# Запуск полного набора unit-тестов
+make test
+
+# Проверка работоспособности сервисов (Smoke test)
+make smoke         # CPE only
+make smoke-dpe     # CPE + DPE integration
+```
+
+### Docker & Dual Stack Deployment
+Для воспроизводимого запуска всей связки (CPE + DPE):
+```bash
+docker compose -f docker-compose.full.yml up --build
+```
+
+### Ключевые переменные окружения (Environment Variables)
+- `CPE_DPE__DB_PATH`: Путь к SQLite базовым данным DPE (по умолчанию `/app/data/dpe_database.db` в Docker).
+- `CPE_RETRAIN_ON_START`: Автоматическое переобучение модели CPE на DPE-данных при старте контейнера (`1` — вкл).
+- `CAUSAL_ENGINE_URL`: URL сервиса CPE для обращений из DPE (по умолчанию `http://localhost:8100`).
+- `CAUSAL_ENABLED`: Флаг включения вызовов Causal ML из DPE (`true` / `false`).
+- `CAUSAL_ENGINE_TIMEOUT_SEC`: Таймаут HTTP запроса DPE -> CPE (default `0.1` sec, fail-open guarantee ≤200ms).
+- `CAUSAL_UPLIFT_THRESHOLD`: Порог определения "Sleeping Dogs" (по умолчанию `0.05`).
+
+### Принцип работы Sleeping Dog Override
+При запросе цены DPE запрашивает прогнозируемый ITE (Uplift) у CPE (`POST /predict_uplift`).
+Если $Uplift < -\text{threshold}$ (пользователь относится к категории **Sleeping Dogs** — повышение цены существенно снижает вероятность заказа), DPE отменяет Surge-надбавку (`CAUSAL_NO_SURGE`), возвращая базовый тариф для сохранения лояльности пользователя.
+
+---
+
+## ⚡ Phase 5: Serve/Train Parity, Observability & Release Hygiene
+
+### Train / Serve Feature Parity
+1. **`past_trips`**: Накопленное количество завершенных поездок водителя (или ячейки H3 при отсутствии истории водителя) **строго до** текущей сессии расчета цены.
+2. **`avg_surge`**: Накопленное среднее значения `surge_bonus` предыдущих поездок водителя **строго до** текущего запроса (0.0 при `past_trips == 0`).
+3. **Parity Enforcement**: Тест `test_history_matches_cpe_connector_parity` гарантирует 1-в-1 совпадение онлайн-накопления `DriverHistoryStore` с оффлайн-трансформациями `load_dpe_data()`.
+
+### Observability в DPE API Response
+В ответ эндпоинта `/api/v1/search` добавлены наглядные поля интеграции:
+```json
+{
+  "h3_index": "881180e001fffff",
+  "price": 219.0,
+  "surge_multiplier": 1.0,
+  "explanation": "Graph-based pricing. ...",
+  "causal_uplift_score": 0.1508,
+  "causal_override": false,
+  "causal_recommended_treatment": "DISCOUNT_10_PCT"
+}
+```
+При срабатывании Sleeping Dog override поле `causal_override` устанавливается в `true`, а в `explanation` добавляется суффикс `Causal override (Sleeping Dog): uplift=... < -threshold`.
+
+### One-Shot Local Smoke Harness
+Для автоматической проверки интеграции без ручного запуска серверов:
+```bash
+make smoke-local
+# или напрямую:
+python scripts/e2e_smoke.py --start-servers --with-dpe
+```
+Данная команда поднимет фоновые сервисы Uvicorn (CPE :8100, DPE :8000), обучит базовую модель при отсутствии артефакта, проверит эндпоинты `/health`, `/predict_uplift`, `/api/v1/search` и закроет фоновые процессы при завершении.
+
+

@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -e .
 
-# Train a model artifact inside the image (synthetic data)
+# Train a fallback model artifact inside the image (synthetic data)
 RUN python scripts/train.py
 
 FROM python:3.11-slim AS runtime
@@ -28,12 +28,19 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /build/src ./src
 COPY --from=builder /build/configs ./configs
+COPY --from=builder /build/scripts ./scripts
 COPY --from=builder /build/artifacts ./artifacts
 COPY --from=builder /build/pyproject.toml ./pyproject.toml
 COPY --from=builder /build/README.md ./README.md
 
+RUN chmod +x /app/scripts/docker_entrypoint.sh \
+    && chown -R appuser:appuser /app
+
 USER appuser
-EXPOSE 8000
+EXPOSE 8100
 
 ENV PYTHONUNBUFFERED=1
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENV CPE_API__PORT=8100
+
+ENTRYPOINT ["/app/scripts/docker_entrypoint.sh"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8100"]

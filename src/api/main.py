@@ -94,6 +94,7 @@ def apply_model_payload(payload: dict[str, Any]) -> None:
     _MODEL_STATE["model"] = payload["model"]
     _MODEL_STATE["feature_columns"] = payload.get("feature_columns", FEATURE_COLUMNS)
     _MODEL_STATE["model_name"] = payload.get("model_name")
+    _MODEL_STATE["source"] = payload.get("source", "unknown")
     _MODEL_STATE["uplift_threshold"] = float(
         payload.get("uplift_threshold", load_config().api.uplift_threshold)
     )
@@ -108,6 +109,7 @@ async def lifespan(app: FastAPI):
         payload = load_model_artifact(path)
         apply_model_payload(payload)
         print(f"Loaded model '{_MODEL_STATE['model_name']}' from {path}")
+        print(f"Source: {_MODEL_STATE['source']}, Feature columns: {_MODEL_STATE['feature_columns']}")
     except FileNotFoundError:
         print(
             f"WARNING: model artifact not found at {path}. "
@@ -151,14 +153,20 @@ class PredictUpliftResponse(BaseModel):
 
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
+def health_check() -> dict[str, Any]:
     status = "ok" if _MODEL_STATE.get("model") is not None else "degraded"
     return {
         "status": status if status == "ok" else "ok",  # health always ok for liveness
         "service": "causal-pricing-engine",
         "model_loaded": "true" if _MODEL_STATE.get("model") is not None else "false",
         "model_name": str(_MODEL_STATE.get("model_name") or ""),
+        "source": str(_MODEL_STATE.get("source") or ""),
+        "feature_columns": _MODEL_STATE.get("feature_columns", []),
     }
+
+
+import math
+import time
 
 
 @app.post("/predict_uplift", response_model=PredictUpliftResponse)
@@ -169,8 +177,22 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
             detail="Model not loaded. Train with `python scripts/train.py` first.",
         )
 
+    for k, v in request.features.items():
+        try:
+            val = float(v)
+            if math.isnan(val) or math.isinf(val):
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Feature '{k}' has invalid non-finite value: {v}",
+            )
+
+    t0 = time.perf_counter()
     uplift_score = score_uplift(request.features)
     treatment, discount = recommend_treatment(uplift_score)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    print(f"[CPE API] /predict_uplift latency: {dt_ms:.2f} ms")
 
     return PredictUpliftResponse(
         user_id=request.user_id,
@@ -179,3 +201,4 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
         optimal_discount_pct=discount,
         model_name=_MODEL_STATE.get("model_name"),
     )
+
