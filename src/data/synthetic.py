@@ -4,27 +4,25 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from src.data.dpe_connector import DPE_FEATURE_COLUMNS
 
-# Shared feature contract used by train script, API, and tests.
-FEATURE_COLUMNS: list[str] = [
-    "past_trips",
-    "avg_surge",
-    "price_sensitivity",
-    "hour_of_day",
-    "segment",
-]
+# Unified canonical feature contract (aligned with DPE simulation schema)
+FEATURE_COLUMNS: list[str] = list(DPE_FEATURE_COLUMNS)
 
 
 def generate_uplift_dataset(
     n: int = 5000,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Generate observational uplift data with heterogeneous treatment effects.
+    """Generate synthetic uplift data with heterogeneous treatment effects matching DPE feature schema.
 
-    Segments (by ``segment`` feature, also driven by ``price_sensitivity``):
-    - High sensitivity (segment 2): strong positive TE (persuadables).
-    - Medium sensitivity (segment 1): near-zero TE (sure things / lost causes).
-    - Low sensitivity (segment 0): negative TE (sleeping dogs).
+    Features generated:
+    - distance_km, duration_sec, price, surge_bonus, hour_of_day, past_trips, avg_surge
+
+    Segments (for heterogeneity testing):
+    - Persuadables (segment 2.0): high past_trips, high surge_bonus -> strong positive uplift (+0.25)
+    - Neutral (segment 1.0): moderate past_trips -> near-zero uplift (~0.0)
+    - Sleeping dogs (segment 0.0): low past_trips, high surge_bonus -> negative uplift (-0.12)
 
     Args:
         n: Number of rows to generate.
@@ -32,22 +30,26 @@ def generate_uplift_dataset(
 
     Returns:
         DataFrame with columns:
-        ``user_id``, feature columns, ``treatment``, ``conversion``, ``revenue``.
+        ``user_id``, DPE_FEATURE_COLUMNS, ``segment``, ``treatment``, ``conversion``, ``revenue``.
     """
     rng = np.random.default_rng(random_state)
 
-    past_trips = rng.poisson(lam=8.0, size=n).astype(float)
-    avg_surge = rng.uniform(1.0, 2.5, size=n)
-    price_sensitivity = rng.uniform(0.0, 1.0, size=n)
+    distance_km = rng.uniform(1.0, 15.0, size=n)
+    duration_sec = distance_km * rng.uniform(120.0, 240.0, size=n)
+    price = 150.0 + distance_km * 25.0 + duration_sec * 0.1
+    surge_bonus = rng.uniform(0.0, 50.0, size=n)
     hour_of_day = rng.integers(0, 24, size=n).astype(float)
+    past_trips = rng.poisson(lam=8.0, size=n).astype(float)
+    avg_surge = rng.uniform(0.0, 30.0, size=n)
 
-    # Discrete segment for explicit heterogeneous TE
-    segment = np.zeros(n, dtype=float)
-    segment[price_sensitivity >= 0.66] = 2.0  # persuadables
-    segment[(price_sensitivity >= 0.33) & (price_sensitivity < 0.66)] = 1.0  # neutral
-    # segment < 0.33 stays 0 — sleeping dogs
+    # Segment definition for heterogeneity tests
+    segment = np.ones(n, dtype=float)  # 1.0 = neutral default
+    persuadable_mask = (past_trips >= 8.0) & (surge_bonus >= 15.0)
+    sleeping_dog_mask = (past_trips < 4.0) & (surge_bonus >= 20.0)
+    segment[persuadable_mask] = 2.0
+    segment[sleeping_dog_mask] = 0.0
 
-    # Randomized treatment assignment (simulates A/B)
+    # Treatment assignment (50/50 randomized A/B)
     treatment = rng.binomial(1, 0.5, size=n)
 
     # True ITE by segment
@@ -59,10 +61,11 @@ def generate_uplift_dataset(
 
     # Baseline conversion probability (control outcome)
     baseline_logit = (
-        -0.8
-        + 0.05 * past_trips
-        - 0.3 * (avg_surge - 1.0)
-        + 0.02 * (hour_of_day - 12.0)
+        -0.5
+        + 0.04 * past_trips
+        - 0.05 * distance_km
+        + 0.01 * surge_bonus
+        - 0.01 * (hour_of_day - 12.0) ** 2
     )
     baseline_prob = 1.0 / (1.0 + np.exp(-baseline_logit))
     treated_prob = np.clip(baseline_prob + true_uplift, 0.01, 0.99)
@@ -70,23 +73,24 @@ def generate_uplift_dataset(
     conversion_prob = np.where(treatment == 1, treated_prob, baseline_prob)
     conversion = rng.binomial(1, conversion_prob)
 
-    # Revenue: base fare-like amount, boosted on conversion and treatment
-    base_revenue = 200.0 + 15.0 * past_trips + 50.0 * avg_surge
+    base_revenue = price + surge_bonus
     revenue = np.where(
         conversion == 1,
-        base_revenue * (1.0 - 0.05 * treatment),  # small discount cost when treated
+        base_revenue * (1.0 - 0.05 * treatment),
         0.0,
     )
-    revenue = revenue + rng.normal(0.0, 10.0, size=n)
-    revenue = np.maximum(revenue, 0.0)
+    revenue = np.maximum(revenue + rng.normal(0.0, 5.0, size=n), 0.0)
 
     df = pd.DataFrame(
         {
             "user_id": [f"u_{i:06d}" for i in range(n)],
+            "distance_km": distance_km,
+            "duration_sec": duration_sec,
+            "price": price,
+            "surge_bonus": surge_bonus,
+            "hour_of_day": hour_of_day,
             "past_trips": past_trips,
             "avg_surge": avg_surge,
-            "price_sensitivity": price_sensitivity,
-            "hour_of_day": hour_of_day,
             "segment": segment,
             "treatment": treatment.astype(int),
             "conversion": conversion.astype(int),

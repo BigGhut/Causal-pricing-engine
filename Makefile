@@ -1,11 +1,14 @@
-.PHONY: install train train-dpe evaluate serve test lint smoke smoke-dpe smoke-local
+.PHONY: install demo train train-dpe evaluate serve test lint smoke smoke-dpe smoke-local
 
 install:
 	pip install -r requirements.txt
 	pip install -e .
 
+demo:
+	python scripts/demo.py
+
 train:
-	python scripts/train.py --source synthetic
+	python scripts/train.py
 
 train-dpe:
 	python scripts/train.py --source dpe
@@ -30,5 +33,3 @@ smoke-dpe:
 
 smoke-local:
 	python scripts/e2e_smoke.py --start-servers --with-dpe
-
-

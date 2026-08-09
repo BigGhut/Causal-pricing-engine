@@ -134,11 +134,13 @@ class PredictUpliftRequest(BaseModel):
         ...,
         examples=[
             {
+                "distance_km": 7.0,
+                "duration_sec": 900.0,
+                "price": 350.0,
+                "surge_bonus": 50.0,
+                "hour_of_day": 18.0,
                 "past_trips": 12.0,
                 "avg_surge": 1.25,
-                "price_sensitivity": 0.8,
-                "hour_of_day": 18.0,
-                "segment": 2.0,
             }
         ],
     )

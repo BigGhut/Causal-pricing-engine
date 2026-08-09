@@ -441,7 +441,7 @@ def test_train_selects_best_among_all_candidates_including_dml(monkeypatch, tmp_
     monkeypatch.setattr(train_mod, "load_config", lambda path=None: small_cfg)
     monkeypatch.setattr(train_mod, "_ROOT", tmp_path)
 
-    result = train_mod.train_and_select(random_state=0)
+    result = train_mod.train_and_select(random_state=0, include_all=True)
 
     metrics = result["metrics"]
     assert set(metrics.keys()) >= {"t_learner", "s_learner", "x_learner", "dml"}
@@ -463,8 +463,6 @@ def test_train_selects_best_among_all_candidates_including_dml(monkeypatch, tmp_
 
     apply_model_payload(payload)
     features = {c: 1.0 for c in FEATURE_COLUMNS}
-    features["price_sensitivity"] = 0.9
-    features["segment"] = 2.0
     score = score_uplift(features)
     assert np.isfinite(score)
     _MODEL_STATE["model"] = None

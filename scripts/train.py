@@ -20,7 +20,7 @@ from sklearn.model_selection import train_test_split
 from src.causal.dml_engine import DMLEngine
 from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearner
 from src.config import load_config
-from src.data.dpe_connector import DPE_FEATURE_COLUMNS, load_dpe_data
+from src.data.dpe_connector import DPE_FEATURE_COLUMNS, load_dpe_data, resolve_dpe_db_path
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
 from src.evaluation.metrics import qini_auc_score, uplift_at_k
 
@@ -58,16 +58,20 @@ def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, ra
 
 
 def train_and_select(
-    source: str = "synthetic",
+    source: str = "auto",
     dpe_db_path: str | Path | None = None,
     random_state: int | None = None,
+    learners: list[str] | None = None,
+    include_all: bool = False,
 ) -> dict:
     """Generate or load data, train candidates, pick best by Qini AUC, dump artifact.
 
     Args:
-        source: Data source type ("synthetic" or "dpe").
+        source: Data source type ("auto", "synthetic", or "dpe"). "auto" picks dpe if DB exists, else synthetic.
         dpe_db_path: Optional custom path to DPE SQLite database.
         random_state: Random state seed.
+        learners: Optional list of learner names ("t_learner", "s_learner", "x_learner", "dml"). Default is ["t_learner"].
+        include_all: If True, train all available candidates (t, s, x, dml).
 
     Returns:
         Dict with metrics and paths for programmatic checks.
@@ -75,10 +79,14 @@ def train_and_select(
     cfg = load_config()
     rs = random_state if random_state is not None else cfg.data.random_state
 
+    resolved_db = resolve_dpe_db_path(dpe_db_path)
     source_clean = source.lower()
+    if source_clean == "auto":
+        source_clean = "dpe" if resolved_db.exists() else "synthetic"
+
     if source_clean == "dpe":
-        print("Loading DPE simulation dataset...")
-        df = load_dpe_data(db_path=dpe_db_path)
+        print(f"Loading DPE simulation dataset from {resolved_db}...")
+        df = load_dpe_data(db_path=resolved_db)
         feature_cols = DPE_FEATURE_COLUMNS
     else:
         print(f"Generating synthetic uplift dataset (n={cfg.data.n_samples})...")
@@ -100,35 +108,44 @@ def train_and_select(
         cfg.model.random_state,
     )
 
-    candidates: dict[str, BaseUpliftModel | DMLEngine] = {
+    # Determine which candidates to train
+    if include_all:
+        target_learners = ["t_learner", "s_learner", "x_learner", "dml"]
+    elif learners:
+        target_learners = [l.lower().strip() for l in learners]
+    else:
+        target_learners = ["t_learner"]
+
+    all_possible: dict[str, BaseUpliftModel | DMLEngine] = {
         "t_learner": TLearner(base_estimator=base),
         "s_learner": SLearner(base_estimator=base),
         "x_learner": XLearner(base_estimator=base),
     }
 
+    candidates: dict[str, BaseUpliftModel | DMLEngine] = {}
+    for lname in target_learners:
+        if lname in all_possible:
+            candidates[lname] = all_possible[lname]
+        elif lname == "dml":
+            candidates["dml"] = DMLEngine(random_state=cfg.model.random_state)
+
     results: dict[str, dict[str, float]] = {}
 
     for name, model in candidates.items():
         print(f"Training {name}...")
-        model.fit(X_train, y_train, t_train)
-        uplift = model.predict_uplift(X_test)
+        if name == "dml":
+            model.fit(Y=y_train, T=t_train, X=X_train, W=None)
+            uplift = model.effect(X_test)
+        else:
+            model.fit(X_train, y_train, t_train)
+            uplift = model.predict_uplift(X_test)
+
         qini = qini_auc_score(y_test, uplift, t_test)
         u_at_k = uplift_at_k(y_test, uplift, t_test, k=0.3)
         results[name] = {"qini_auc": float(qini), "uplift_at_k": float(u_at_k)}
         print(f"  {name}: Qini AUC={qini:.4f}, Uplift@k={u_at_k:.4f}")
 
-    # DML on continuous/binary outcome
-    print("Training dml_engine...")
-    dml = DMLEngine(random_state=cfg.model.random_state)
-    dml.fit(Y=y_train, T=t_train, X=X_train, W=None)
-    dml_uplift = dml.effect(X_test)
-    dml_qini = qini_auc_score(y_test, dml_uplift, t_test)
-    dml_uk = uplift_at_k(y_test, dml_uplift, t_test, k=0.3)
-    results["dml"] = {"qini_auc": float(dml_qini), "uplift_at_k": float(dml_uk)}
-    print(f"  dml: Qini AUC={dml_qini:.4f}, Uplift@k={dml_uk:.4f}")
-    candidates["dml"] = dml
-
-    # Select best by Qini AUC among ALL candidates
+    # Select best by Qini AUC among trained candidates
     scores = {k: v["qini_auc"] for k, v in results.items()}
     best_name = max(scores, key=scores.get)  # type: ignore[arg-type]
     best_model = candidates[best_name]
@@ -154,6 +171,10 @@ def train_and_select(
     print(f"Qini AUC:    {results[best_name]['qini_auc']:.4f}")
     print(f"Uplift@k:    {results[best_name]['uplift_at_k']:.4f}")
     print(f"Saved to:    {model_path}")
+    print(
+        "Portfolio Note: Model artifact saved with train/serve parity feature contract (DPE_FEATURE_COLUMNS).\n"
+        "Runtime DPE integration checks /predict_uplift at :8100 with fail-open fallback."
+    )
 
     return {
         "best_name": best_name,
@@ -166,9 +187,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train uplift models and save artifact.")
     parser.add_argument(
         "--source",
-        choices=["synthetic", "dpe"],
-        default="synthetic",
-        help="Data source: synthetic (default) or dpe (DPE SQLite DB)",
+        choices=["auto", "synthetic", "dpe"],
+        default="auto",
+        help="Data source: auto (default, picks DPE if DB exists), synthetic, or dpe",
     )
     parser.add_argument(
         "--dpe-db-path",
@@ -176,9 +197,26 @@ def main() -> None:
         default=None,
         help="Optional custom path to dpe_database.db",
     )
+    parser.add_argument(
+        "--learners",
+        type=str,
+        default="t_learner",
+        help="Comma-separated learners to evaluate: t_learner (default), s_learner, x_learner, dml",
+    )
+    parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Train and evaluate all available candidate models (t, s, x, dml)",
+    )
     args = parser.parse_args()
 
-    train_and_select(source=args.source, dpe_db_path=args.dpe_db_path)
+    learners_list = [s.strip() for s in args.learners.split(",")] if args.learners else None
+    train_and_select(
+        source=args.source,
+        dpe_db_path=args.dpe_db_path,
+        learners=learners_list,
+        include_all=args.include_all,
+    )
 
 
 if __name__ == "__main__":
