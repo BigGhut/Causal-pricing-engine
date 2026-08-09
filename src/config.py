@@ -1,12 +1,37 @@
-"""Configuration loader for Causal Pricing Engine."""
+"""Configuration loader for Causal Pricing Engine.
+
+Uses **pydantic-settings** ``BaseSettings`` so values can be overridden via
+environment variables after YAML defaults are applied.
+
+Environment variables
+---------------------
+Prefix: ``CPE_``
+Nested delimiter: ``__``
+
+Examples (override YAML / field defaults)::
+
+    CPE_API__HOST=127.0.0.1
+    CPE_API__PORT=9000
+    CPE_MODEL__BASE_LEARNER=gradient_boosting
+    CPE_MODEL__N_ESTIMATORS=50
+    CPE_MODEL__LEARNING_RATE=0.05
+    CPE_EXPERIMENT__ALPHA=0.01
+    CPE_EXPERIMENT__POWER=0.9
+    CPE_EXPERIMENT__MDE=0.01
+    CPE_DATA__N_SAMPLES=1000
+
+YAML still supplies file-based defaults from ``configs/config.yaml``.
+When both YAML and env set the same field, **env wins**.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings.sources import YamlConfigSettingsSource
 
 
 class ModelConfig(BaseModel):
@@ -42,8 +67,19 @@ class DataConfig(BaseModel):
     random_state: int = 42
 
 
-class AppConfig(BaseModel):
-    """Root application configuration."""
+class AppConfig(BaseSettings):
+    """Root application configuration (pydantic-settings ``BaseSettings``).
+
+    Nested sections are overridable via env vars with prefix ``CPE_`` and
+    delimiter ``__`` (e.g. ``CPE_API__PORT=9000``).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="CPE_",
+        env_nested_delimiter="__",
+        extra="ignore",
+        env_file=None,
+    )
 
     model: ModelConfig = Field(default_factory=ModelConfig)
     experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
@@ -57,20 +93,43 @@ def _default_config_path() -> Path:
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
-    """Load application config from a YAML file.
+    """Load application config from YAML, then apply env overrides.
 
     Args:
         path: Optional path to YAML. Defaults to ``configs/config.yaml``
             under the project root.
 
     Returns:
-        Validated ``AppConfig`` instance.
+        Validated ``AppConfig`` (``BaseSettings``) instance.
+
+    Env overrides use prefix ``CPE_`` and nested delimiter ``__``
+    (see module docstring). Env values take precedence over YAML.
     """
     config_path = Path(path) if path is not None else _default_config_path()
-    if not config_path.exists():
-        return AppConfig()
 
-    with config_path.open(encoding="utf-8") as fh:
-        raw: dict[str, Any] = yaml.safe_load(fh) or {}
+    class _LoadedConfig(AppConfig):
+        """Bound to a specific YAML path for this load call."""
 
-    return AppConfig.model_validate(raw)
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls: type[BaseSettings],
+            init_settings: PydanticBaseSettingsSource,
+            env_settings: PydanticBaseSettingsSource,
+            dotenv_settings: PydanticBaseSettingsSource,
+            file_secret_settings: PydanticBaseSettingsSource,
+        ) -> tuple[PydanticBaseSettingsSource, ...]:
+            # Priority (first wins): init kwargs > env > YAML file > secrets.
+            # Callers rarely pass init; env must beat YAML so CPE_* overrides work.
+            yaml_source = YamlConfigSettingsSource(
+                settings_cls,
+                yaml_file=config_path if config_path.exists() else None,
+            )
+            return (
+                init_settings,
+                env_settings,
+                yaml_source,
+                file_secret_settings,
+            )
+
+    return _LoadedConfig()

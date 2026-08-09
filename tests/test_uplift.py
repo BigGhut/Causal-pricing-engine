@@ -277,15 +277,81 @@ def test_synthetic_dataset_schema_and_heterogeneity():
 
 
 def test_load_config_has_required_sections():
+    """YAML load path exposes model / experiment / api sections."""
+    from pydantic_settings import BaseSettings
+
     cfg = load_config()
     assert isinstance(cfg, AppConfig)
+    assert isinstance(cfg, BaseSettings)
     assert cfg.model.base_learner
     assert cfg.model.n_estimators > 0
+    assert isinstance(cfg.model.learning_rate, float)
     assert 0 < cfg.experiment.alpha < 1
     assert 0 < cfg.experiment.power < 1
     assert cfg.experiment.mde > 0
     assert cfg.api.host
     assert cfg.api.port > 0
+
+
+def test_load_config_env_overrides_yaml(monkeypatch: pytest.MonkeyPatch):
+    """Shipped load_config must apply CPE_* env over YAML defaults."""
+    # Baseline from YAML (no CPE_ env)
+    for key in list(__import__("os").environ):
+        if key.startswith("CPE_"):
+            monkeypatch.delenv(key, raising=False)
+
+    baseline = load_config()
+    assert baseline.api.port == 8000
+    assert baseline.api.host == "0.0.0.0"
+    assert baseline.model.base_learner == "logistic_regression"
+
+    monkeypatch.setenv("CPE_API__PORT", "9123")
+    monkeypatch.setenv("CPE_API__HOST", "127.0.0.1")
+    monkeypatch.setenv("CPE_MODEL__BASE_LEARNER", "gradient_boosting")
+    monkeypatch.setenv("CPE_MODEL__N_ESTIMATORS", "42")
+    monkeypatch.setenv("CPE_MODEL__LEARNING_RATE", "0.05")
+    monkeypatch.setenv("CPE_EXPERIMENT__ALPHA", "0.01")
+    monkeypatch.setenv("CPE_EXPERIMENT__POWER", "0.9")
+    monkeypatch.setenv("CPE_EXPERIMENT__MDE", "0.03")
+
+    overridden = load_config()
+    assert overridden.api.port == 9123
+    assert overridden.api.host == "127.0.0.1"
+    assert overridden.model.base_learner == "gradient_boosting"
+    assert overridden.model.n_estimators == 42
+    assert overridden.model.learning_rate == pytest.approx(0.05)
+    assert overridden.experiment.alpha == pytest.approx(0.01)
+    assert overridden.experiment.power == pytest.approx(0.9)
+    assert overridden.experiment.mde == pytest.approx(0.03)
+    # Unrelated YAML field still present
+    assert overridden.api.model_path
+
+    # Cleanup is via monkeypatch teardown; also assert clear restores YAML
+    monkeypatch.delenv("CPE_API__PORT", raising=False)
+    monkeypatch.delenv("CPE_API__HOST", raising=False)
+    monkeypatch.delenv("CPE_MODEL__BASE_LEARNER", raising=False)
+    monkeypatch.delenv("CPE_MODEL__N_ESTIMATORS", raising=False)
+    monkeypatch.delenv("CPE_MODEL__LEARNING_RATE", raising=False)
+    monkeypatch.delenv("CPE_EXPERIMENT__ALPHA", raising=False)
+    monkeypatch.delenv("CPE_EXPERIMENT__POWER", raising=False)
+    monkeypatch.delenv("CPE_EXPERIMENT__MDE", raising=False)
+
+    restored = load_config()
+    assert restored.api.port == baseline.api.port
+    assert restored.model.base_learner == baseline.model.base_learner
+
+
+def test_config_module_uses_pydantic_settings():
+    """Static/source contract: root settings subclass BaseSettings."""
+    import inspect
+
+    import src.config as config_mod
+    from pydantic_settings import BaseSettings
+
+    assert issubclass(config_mod.AppConfig, BaseSettings)
+    source = inspect.getsource(config_mod)
+    assert "pydantic_settings" in source or "from pydantic_settings" in source
+    assert "BaseSettings" in source
 
 
 # ---------------------------------------------------------------------------
