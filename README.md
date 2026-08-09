@@ -13,6 +13,8 @@ $$\tau(x) = \mathbb{E}[Y^{(1)} - Y^{(0)} \mid X = x]$$
 
 Where $Y^{(1)}$ is the outcome under treatment (e.g. discount or surge bonus), $Y^{(0)}$ is the baseline outcome under control, and $\tau(x)$ represents the net incremental gain attributable strictly to the treatment.
 
+> **Disclaimer & Scope**: The default demo uses synthetic data with **seeded HTE** to demonstrate pipeline mechanics & policy rules rather than claiming production city-scale lift. Qini coefficients are **normalized** ($\approx [-1, 1]$, random null $\approx 0$). DPE simulation logs represent observational data with potential post-treatment feature entanglement (see `CASE_STUDY.md`).
+
 ---
 
 ## System Architecture
@@ -58,57 +60,48 @@ Where $Y^{(1)}$ is the outcome under treatment (e.g. discount or surge bonus), $
 pip install -r requirements.txt
 pip install -e .
 
-# 2. Run in-process portfolio demo
+# 2. Honest in-process demo (labels match score signs)
 python scripts/demo.py
 
-# 3. (Optional) Train model on DPE SQLite simulation data
-python scripts/train.py --source dpe
+# 3. Portfolio proof: live CPE HTTP + DPE policy rule → docs/evidence/
+python scripts/portfolio_proof.py
+# make proof
 
-# 4. (Optional) Run dual service stack locally
+# 4. (Optional) Dual service stack + proof against live DPE
 # Terminal 1: uvicorn src.api.main:app --port 8100
 # Terminal 2: cd ../dynamic-pricing-engine && uvicorn src.api.main:app --port 8000
+# python scripts/portfolio_proof.py --with-dpe
 ```
 
-For Makefile shortcuts, run `make demo`, `make train`, `make test`, or `make smoke-local`.
+Makefile: `make demo`, `make proof`, `make train`, `make test`, `make smoke-local`.
+
+**Read next:** [CASE_STUDY.md](CASE_STUDY.md) (problem → approach → trade-offs) · [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md) (captured JSON after `make proof`).
 
 ---
 
-## Model Performance & Inference Output
+## Honest Demo & Proof
 
-### Offline Evaluation (Qini Curve AUC)
-Models are evaluated on holdout simulation data using the Qini AUC metric:
-- **T-Learner (GBM)**: Qini AUC = `551.72` | Uplift@30% = `0.108`
-- **Double ML (LinearDML)**: Qini AUC = `598.42` | Uplift@30% = `-0.035`
+### Demo (`scripts/demo.py`)
 
-### Sample Prediction Request (`POST /predict_uplift`)
-```json
-{
-  "user_id": "drv_1042",
-  "features": {
-    "distance_km": 7.5,
-    "duration_sec": 900.0,
-    "price": 320.0,
-    "surge_bonus": 45.0,
-    "hour_of_day": 18.0,
-    "past_trips": 15.0,
-    "avg_surge": 20.0
-  }
-}
-```
+Does **not** invent decorative feature vectors. Scores holdout and picks three **real rows**:
 
-### Sample DPE Response with Causal Fields (`POST /api/v1/search`)
-```json
-{
-  "h3_index": "881180e001fffff",
-  "price": 320.0,
-  "surge_multiplier": 1.0,
-  "explanation": "Graph-based pricing. Causal override (Sleeping Dog): uplift=-0.0840 < -0.05.",
-  "causal_uplift_score": -0.0840,
-  "causal_override": true,
-  "causal_recommended_treatment": "NO_DISCOUNT_AVOID"
-}
-```
+| Role | Selection rule | Policy at ±0.05 |
+|:---|:---|:---|
+| **persuadable** | max τ̂ | apply treatment |
+| **neutral** | τ̂ ≈ 0 | baseline fare |
+| **sleeping_dog** | min τ̂ | suppress surge |
 
+If both clear +/− HTE cannot be found, the demo **fails** (or retries synthetic) instead of lying.
+
+### Proof (`scripts/portfolio_proof.py`)
+
+1. Same honest picks  
+2. Starts CPE if needed  
+3. `POST /predict_uplift` for each role (asserts treatment codes)  
+4. Applies **the same override rule as DPE** (`τ̂ < −θ → causal_override`)  
+5. Writes **captured** output to `docs/evidence/latest_proof.md`  
+
+Optional `--with-dpe` records a live `/api/v1/search` (graph features may differ; override there is informative, not asserted).
 ---
 
 ## Project Layout
@@ -136,13 +129,13 @@ causal-pricing-engine/
 
 ## What I'd Improve Next
 
-1. **Continuous Policy Optimization**: Replace static thresholding with dynamic contextual bandit / offline reinforcement learning (e.g. Doubly Robust Policy Evaluation).
-2. **Feature Store Synchronization**: Replace direct SQLite queries with real-time Redis feature streaming for sub-millisecond feature lookup.
-3. **Adaptive Switchback Windowing**: Dynamically resize spatial-temporal switchback blocks based on real-time graph congestion metrics.
+1. Larger switchback logs + CUPED readout of the override policy (not only Qini on holdout).  
+2. Multi-treatment (surge levels / discount depths) instead of binary treat/control.  
+3. Shared online feature store so graph features under load match offline training columns.
 
 ---
 
-## Process Artifacts & Multi-Agent Build History
+## Process archive
 
-All phase handoff notes, audit reports, and multi-agent development logs are preserved in [`docs/archive/`](docs/archive/README.md).
-For more details on DPE integration, see [`CAUSAL.md`](../dynamic-pricing-engine/CAUSAL.md) in the DPE repository.
+Multi-agent handoffs and audits: [`docs/archive/`](docs/archive/README.md).  
+DPE integration notes: [`CAUSAL.md`](../dynamic-pricing-engine/CAUSAL.md).

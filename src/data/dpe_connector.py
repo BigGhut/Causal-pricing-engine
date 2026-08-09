@@ -17,6 +17,14 @@ DPE_FEATURE_COLUMNS: list[str] = [
     "avg_surge",
 ]
 
+DPE_PRE_TREATMENT_FEATURES: list[str] = [
+    "distance_km",
+    "duration_sec",
+    "hour_of_day",
+    "past_trips",
+    "avg_surge",
+]
+
 DEFAULT_DPE_DB_PATH: Path = (
     Path("Z:/pet-project/dynamic-pricing-engine/dpe_database.db")
 )
@@ -61,21 +69,26 @@ def resolve_dpe_db_path(db_path: str | Path | None = None) -> Path:
 
 def load_dpe_data(
     db_path: str | Path | None = None,
+    feature_mode: str = "serve_parity",
 ) -> pd.DataFrame:
     """Load simulation_analytics from DPE SQLite database and transform to CPE format.
 
     Args:
         db_path: Optional path to dpe_database.db SQLite file.
+        feature_mode: "serve_parity" (default, 7 features including price/surge_bonus) or
+                     "pre_treatment" (5 features excluding post-treatment price/surge_bonus).
 
     Returns:
         DataFrame with columns:
-        ``user_id``, ``distance_km``, ``duration_sec``, ``price``, ``surge_bonus``,
-        ``hour_of_day``, ``past_trips``, ``avg_surge``, ``treatment``, ``conversion``, ``revenue``.
+        ``user_id``, selected feature columns, ``treatment``, ``conversion``, ``revenue``.
 
     Raises:
         FileNotFoundError: If the specified SQLite database file does not exist.
-        ValueError: If the database is missing required tables or columns.
+        ValueError: If the database is missing required tables or columns or invalid feature_mode.
     """
+    if feature_mode not in {"serve_parity", "pre_treatment"}:
+        raise ValueError(f"Invalid feature_mode '{feature_mode}'. Must be 'serve_parity' or 'pre_treatment'.")
+
     target_path = resolve_dpe_db_path(db_path)
 
     if not target_path.exists():
@@ -131,14 +144,21 @@ def load_dpe_data(
         .astype(float)
     )
 
+    # Selected feature columns based on mode
+    active_features = (
+        DPE_PRE_TREATMENT_FEATURES
+        if feature_mode == "pre_treatment"
+        else DPE_FEATURE_COLUMNS
+    )
+
     # Ensure required feature columns exist and are clean floats
-    for col in DPE_FEATURE_COLUMNS:
+    for col in active_features:
         df[col] = df[col].astype(float)
 
     # Final column ordering
     output_cols = (
         ["user_id"]
-        + DPE_FEATURE_COLUMNS
+        + active_features
         + ["treatment", "conversion", "revenue"]
     )
     return df[output_cols]

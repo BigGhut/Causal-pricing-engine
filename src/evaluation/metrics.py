@@ -1,4 +1,4 @@
-"""Offline uplift evaluation metrics: Qini, Uplift@k, percentile curves."""
+"""Offline uplift evaluation metrics: Qini coefficient, Uplift@k, percentile curves."""
 
 from __future__ import annotations
 
@@ -10,41 +10,25 @@ def _as_1d(*arrays: np.ndarray | pd.Series | list) -> tuple[np.ndarray, ...]:
     return tuple(np.asarray(a).ravel() for a in arrays)
 
 
-def qini_auc_score(
-    y: np.ndarray | pd.Series,
-    uplift: np.ndarray | pd.Series,
-    treatment: np.ndarray | pd.Series,
-) -> float:
-    """Area under the Qini curve (normalized by ideal area when possible).
+def _qini_cumulative(
+    y: np.ndarray,
+    treatment: np.ndarray,
+    order: np.ndarray,
+) -> np.ndarray:
+    """Cumulative Qini curve for a given ranking (length n+1, starts at 0).
 
-    Ranks samples by predicted uplift (descending) and computes cumulative
-    incremental outcomes of treatment vs control. The Qini coefficient is
-    the area between the Qini curve and the random baseline.
-
-    Args:
-        y: Binary or continuous outcomes.
-        uplift: Predicted ITE scores.
-        treatment: Binary treatment indicators (0/1).
-
-    Returns:
-        Qini AUC (area between model curve and random diagonal), float.
+    At step k (after first k ranked samples):
+        Q(k) = sum(y|T=1) - sum(y|T=0) * (n_t / n_c)
+    i.e. incremental treated outcomes vs scaled control outcomes.
     """
-    y_arr, u_arr, t_arr = _as_1d(y, uplift, treatment)
-    n = len(y_arr)
-    if n == 0:
-        return 0.0
-
-    order = np.argsort(-u_arr)
-    y_s = y_arr[order]
-    t_s = t_arr[order]
-
-    # Cumulative incremental gain
+    y_s = y[order]
+    t_s = treatment[order]
+    n = len(y_s)
+    qini = np.zeros(n + 1, dtype=float)
     n_t = 0.0
     n_c = 0.0
     sum_y_t = 0.0
     sum_y_c = 0.0
-    qini_values = np.zeros(n + 1, dtype=float)
-
     for i in range(n):
         if t_s[i] == 1:
             n_t += 1
@@ -52,19 +36,95 @@ def qini_auc_score(
         else:
             n_c += 1
             sum_y_c += y_s[i]
-
-        # Incremental = treated outcomes − control outcomes scaled to treated size
         if n_c > 0:
-            qini_values[i + 1] = sum_y_t - sum_y_c * (n_t / n_c)
+            qini[i + 1] = sum_y_t - sum_y_c * (n_t / n_c)
         else:
-            qini_values[i + 1] = sum_y_t
+            qini[i + 1] = sum_y_t
+    return qini
 
-    # Area under Qini curve via trapezoid; subtract random baseline triangle
-    x = np.arange(n + 1, dtype=float)
-    area_model = float(np.trapezoid(qini_values, x))
-    # Random baseline: straight line from 0 to final qini
-    area_random = float(np.trapezoid(np.linspace(0.0, qini_values[-1], n + 1), x))
+
+def _area_above_random(qini: np.ndarray) -> float:
+    """∫(Qini_model - Qini_random) over population fraction x ∈ [0, 1].
+
+    Using fraction on the x-axis avoids the old O(n²) raw trapz over sample index
+    that produced misleading values like ~10_000 on n≈900.
+    """
+    n = len(qini) - 1
+    if n <= 0:
+        return 0.0
+    x = np.linspace(0.0, 1.0, n + 1)
+    area_model = float(np.trapezoid(qini, x))
+    # Random baseline: straight line from 0 to final Qini value
+    area_random = float(np.trapezoid(np.linspace(0.0, qini[-1], n + 1), x))
     return area_model - area_random
+
+
+def qini_auc_score(
+    y: np.ndarray | pd.Series,
+    uplift: np.ndarray | pd.Series,
+    treatment: np.ndarray | pd.Series,
+    *,
+    normalize: bool = True,
+) -> float:
+    """Qini coefficient (default) or unnormalized Qini area.
+
+    Ranks samples by predicted uplift (descending) and builds the cumulative
+    Qini curve. The reported score is the area between the model curve and the
+    random diagonal, with x = population fraction in ``[0, 1]``.
+
+    When ``normalize=True`` (default), that area is divided by the same area for
+    an **oracle ranking** that uses labels only for evaluation (not for training):
+
+        perfect_score_i = y_i * (2 * t_i - 1)
+
+    so treated responders rank high and control responders rank low. The ratio
+    is a Qini *coefficient*-style number typically in roughly ``[-1, 1]``
+    (can slightly exceed bounds on small samples).
+
+    Args:
+        y: Binary or continuous outcomes.
+        uplift: Predicted ITE scores (higher = prioritize for treatment).
+        treatment: Binary treatment indicators (0/1).
+        normalize: If True, return coefficient vs oracle; if False, return
+            unnormalized area over population fraction (still O(effect), not O(n²)).
+
+    Returns:
+        float score. Higher is better. Random ranking → ≈ 0 when normalized.
+    """
+    y_arr, u_arr, t_arr = _as_1d(y, uplift, treatment)
+    n = len(y_arr)
+    if n == 0:
+        return 0.0
+    if len(u_arr) != n or len(t_arr) != n:
+        raise ValueError("y, uplift, and treatment must have the same length")
+
+    order = np.argsort(-u_arr, kind="mergesort")
+    qini_model = _qini_cumulative(y_arr, t_arr, order)
+    area_model = _area_above_random(qini_model)
+
+    if not normalize:
+        return float(area_model)
+
+    # Oracle ranking for denominator (evaluation only — uses y,t not model)
+    perfect_scores = y_arr * (2.0 * t_arr - 1.0)
+    order_star = np.argsort(-perfect_scores, kind="mergesort")
+    qini_star = _qini_cumulative(y_arr, t_arr, order_star)
+    area_star = _area_above_random(qini_star)
+
+    # Degenerate: no incremental structure → coefficient 0
+    if abs(area_star) < 1e-12:
+        return 0.0
+
+    return float(area_model / area_star)
+
+
+def qini_auc_score_unnormalized(
+    y: np.ndarray | pd.Series,
+    uplift: np.ndarray | pd.Series,
+    treatment: np.ndarray | pd.Series,
+) -> float:
+    """Unnormalized Qini area over population fraction (for debugging)."""
+    return qini_auc_score(y, uplift, treatment, normalize=False)
 
 
 def uplift_at_k(
@@ -145,7 +205,6 @@ def uplift_by_percentile(
     y_s = y_arr[order]
     t_s = t_arr[order]
 
-    # Split into roughly equal bins from highest uplift to lowest
     bins = np.array_split(np.arange(n), n_bins)
     rows: list[dict] = []
     for i, idx in enumerate(bins):

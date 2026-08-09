@@ -79,6 +79,31 @@ def test_load_dpe_data_fixture(tmp_path: Path):
     assert (df["avg_surge"] >= 0).all()
 
 
+def test_load_dpe_data_feature_modes(tmp_path: Path):
+    """Test feature_mode='pre_treatment' vs 'serve_parity' in load_dpe_data."""
+    from src.data.dpe_connector import DPE_PRE_TREATMENT_FEATURES
+
+    db_path = tmp_path / "test_dpe_modes.db"
+    create_dummy_dpe_db(db_path, n_rows=20)
+
+    # serve_parity (default)
+    df_serve = load_dpe_data(db_path=db_path, feature_mode="serve_parity")
+    for col in DPE_FEATURE_COLUMNS:
+        assert col in df_serve.columns
+    assert "price" in df_serve.columns
+    assert "surge_bonus" in df_serve.columns
+
+    # pre_treatment
+    df_pretreat = load_dpe_data(db_path=db_path, feature_mode="pre_treatment")
+    for col in DPE_PRE_TREATMENT_FEATURES:
+        assert col in df_pretreat.columns
+    assert "price" not in df_pretreat.columns
+    assert "surge_bonus" not in df_pretreat.columns
+
+    with pytest.raises(ValueError, match="Invalid feature_mode"):
+        load_dpe_data(db_path=db_path, feature_mode="invalid_mode")
+
+
 def test_resolve_dpe_db_path_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Test that CPE_DPE__DB_PATH env var overrides resolution when file exists."""
     dummy_db = tmp_path / "custom_env_dpe.db"

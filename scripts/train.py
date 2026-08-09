@@ -20,7 +20,12 @@ from sklearn.model_selection import train_test_split
 from src.causal.dml_engine import DMLEngine
 from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearner
 from src.config import load_config
-from src.data.dpe_connector import DPE_FEATURE_COLUMNS, load_dpe_data, resolve_dpe_db_path
+from src.data.dpe_connector import (
+    DPE_FEATURE_COLUMNS,
+    DPE_PRE_TREATMENT_FEATURES,
+    load_dpe_data,
+    resolve_dpe_db_path,
+)
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
 from src.evaluation.metrics import qini_auc_score, uplift_at_k
 
@@ -63,6 +68,7 @@ def train_and_select(
     random_state: int | None = None,
     learners: list[str] | None = None,
     include_all: bool = False,
+    feature_mode: str = "serve_parity",
 ) -> dict:
     """Generate or load data, train candidates, pick best by Qini AUC, dump artifact.
 
@@ -72,6 +78,7 @@ def train_and_select(
         random_state: Random state seed.
         learners: Optional list of learner names ("t_learner", "s_learner", "x_learner", "dml"). Default is ["t_learner"].
         include_all: If True, train all available candidates (t, s, x, dml).
+        feature_mode: "serve_parity" (default) or "pre_treatment" (for DPE source).
 
     Returns:
         Dict with metrics and paths for programmatic checks.
@@ -85,9 +92,13 @@ def train_and_select(
         source_clean = "dpe" if resolved_db.exists() else "synthetic"
 
     if source_clean == "dpe":
-        print(f"Loading DPE simulation dataset from {resolved_db}...")
-        df = load_dpe_data(db_path=resolved_db)
-        feature_cols = DPE_FEATURE_COLUMNS
+        print(f"Loading DPE simulation dataset from {resolved_db} (mode={feature_mode})...")
+        df = load_dpe_data(db_path=resolved_db, feature_mode=feature_mode)
+        feature_cols = (
+            DPE_PRE_TREATMENT_FEATURES
+            if feature_mode == "pre_treatment"
+            else DPE_FEATURE_COLUMNS
+        )
     else:
         print(f"Generating synthetic uplift dataset (n={cfg.data.n_samples})...")
         df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=rs)
@@ -143,7 +154,7 @@ def train_and_select(
         qini = qini_auc_score(y_test, uplift, t_test)
         u_at_k = uplift_at_k(y_test, uplift, t_test, k=0.3)
         results[name] = {"qini_auc": float(qini), "uplift_at_k": float(u_at_k)}
-        print(f"  {name}: Qini AUC={qini:.4f}, Uplift@k={u_at_k:.4f}")
+        print(f"  {name}: Qini coef={qini:+.4f}, Uplift@k={u_at_k:+.4f}")
 
     # Select best by Qini AUC among trained candidates
     scores = {k: v["qini_auc"] for k, v in results.items()}
@@ -168,7 +179,7 @@ def train_and_select(
     print("\n=== Training complete ===")
     print(f"Data source: {source_clean}")
     print(f"Best model:  {best_name}")
-    print(f"Qini AUC:    {results[best_name]['qini_auc']:.4f}")
+    print(f"Qini coef:   {results[best_name]['qini_auc']:+.4f}  (normalized ~[-1,1])")
     print(f"Uplift@k:    {results[best_name]['uplift_at_k']:.4f}")
     print(f"Saved to:    {model_path}")
     print(
@@ -208,6 +219,12 @@ def main() -> None:
         action="store_true",
         help="Train and evaluate all available candidate models (t, s, x, dml)",
     )
+    parser.add_argument(
+        "--feature-mode",
+        choices=["serve_parity", "pre_treatment"],
+        default="serve_parity",
+        help="Feature mode for DPE source: serve_parity (default, 7 features) or pre_treatment (5 features)",
+    )
     args = parser.parse_args()
 
     learners_list = [s.strip() for s in args.learners.split(",")] if args.learners else None
@@ -216,6 +233,7 @@ def main() -> None:
         dpe_db_path=args.dpe_db_path,
         learners=learners_list,
         include_all=args.include_all,
+        feature_mode=args.feature_mode,
     )
 
 

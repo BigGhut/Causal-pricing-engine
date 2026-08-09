@@ -85,19 +85,26 @@ def test_learners_accept_dataframe(synthetic_binary):
 
 
 def test_meta_learners_detect_heterogeneity():
-    """On synthetic data with known positive TE segment, mean uplift should be higher there."""
+    """On synthetic data with known positive TE segment, mean uplift should be higher there on holdout."""
+    from sklearn.model_selection import train_test_split
+
     df = generate_uplift_dataset(n=2000, random_state=7)
     X = df[FEATURE_COLUMNS].to_numpy()
     y = df["conversion"].to_numpy()
     t = df["treatment"].to_numpy()
+    seg = df["segment"].to_numpy()
+
+    X_tr, X_te, y_tr, y_te, t_tr, t_te, seg_tr, seg_te = train_test_split(
+        X, y, t, seg, test_size=0.3, random_state=7, stratify=t
+    )
 
     model = TLearner(base_estimator=GradientBoostingClassifier(n_estimators=30, random_state=7))
-    model.fit(X, y, t)
-    uplift = model.predict_uplift(X)
+    model.fit(X_tr, y_tr, t_tr)
+    uplift = model.predict_uplift(X_te)
 
-    high = uplift[df["segment"].to_numpy() == 2.0]
-    low = uplift[df["segment"].to_numpy() == 0.0]
-    # Persuadables should have higher predicted uplift than sleeping dogs
+    high = uplift[seg_te == 2.0]
+    low = uplift[seg_te == 0.0]
+    # Persuadables should have higher predicted uplift than sleeping dogs on holdout
     assert high.mean() > low.mean()
 
 
@@ -210,21 +217,74 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     y = df["conversion"].to_numpy()
     t = df["treatment"].to_numpy()
 
-    model = TLearner(base_estimator=LogisticRegression(max_iter=500))
-    model.fit(X, y, t)
-    uplift = model.predict_uplift(X)
+    # Holdout only — avoid train=test optimism for metric checks
+    from sklearn.model_selection import train_test_split
 
-    qini = qini_auc_score(y, uplift, t)
-    u_k = uplift_at_k(y, uplift, t, k=0.3)
+    X_tr, X_te, y_tr, y_te, t_tr, t_te = train_test_split(
+        X, y, t, test_size=0.35, random_state=3, stratify=t
+    )
+    model = TLearner(base_estimator=LogisticRegression(max_iter=500))
+    model.fit(X_tr, y_tr, t_tr)
+    uplift = model.predict_uplift(X_te)
+
+    qini = qini_auc_score(y_te, uplift, t_te)
+    u_k = uplift_at_k(y_te, uplift, t_te, k=0.3)
     assert np.isfinite(qini)
     assert np.isfinite(u_k)
+    # Normalized coefficient should be on a human scale (not thousands)
+    assert -1.5 <= qini <= 1.5
 
-    # Random uplift should not dominate a trained model on structured data
     rng = np.random.default_rng(0)
-    random_u = rng.normal(size=len(y))
-    qini_random = qini_auc_score(y, random_u, t)
-    # Soft check: model Qini is a real number (random may occasionally win on small n)
-    assert isinstance(qini, float)
+    random_u = rng.normal(size=len(y_te))
+    qini_random = qini_auc_score(y_te, random_u, t_te)
+    # Model should beat random on structured synthetic HTE (soft margin)
+    assert qini > qini_random - 0.05
+
+
+def test_qini_beats_random_on_holdout():
+    """Verify T-Learner Qini significantly beats random null on holdout (synthetic n=1500, 30% test)."""
+    from sklearn.model_selection import train_test_split
+
+    df = generate_uplift_dataset(n=1500, random_state=42)
+    X = df[FEATURE_COLUMNS].to_numpy()
+    y = df["conversion"].to_numpy()
+    t = df["treatment"].to_numpy()
+
+    X_tr, X_te, y_tr, y_te, t_tr, t_te = train_test_split(
+        X, y, t, test_size=0.3, random_state=42, stratify=t
+    )
+    model = TLearner(
+        base_estimator=GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=42)
+    )
+    model.fit(X_tr, y_tr, t_tr)
+    u_te = model.predict_uplift(X_te)
+
+    qini_model = qini_auc_score(y_te, u_te, t_te)
+    rng = np.random.default_rng(42)
+    qini_random = qini_auc_score(y_te, rng.normal(size=len(y_te)), t_te)
+
+    assert qini_model > qini_random + 0.02 or (qini_model > 0 and abs(qini_random) < 0.15)
+    assert -1.5 <= qini_model <= 1.5
+
+
+def test_qini_normalized_oracle_and_null():
+    """Normalized Qini: random ≈ 0, oracle ≈ 1, unnormalized not O(n²)."""
+    df = generate_uplift_dataset(n=1200, random_state=7)
+    y = df["conversion"].to_numpy()
+    t = df["treatment"].to_numpy()
+    # Oracle score used in denominator definition
+    oracle = y * (2.0 * t - 1.0)
+    q_oracle = qini_auc_score(y, oracle, t, normalize=True)
+    assert q_oracle == pytest.approx(1.0, abs=1e-9)
+
+    rng = np.random.default_rng(1)
+    q_rand = qini_auc_score(y, rng.normal(size=len(y)), t, normalize=True)
+    assert abs(q_rand) < 0.25  # small-sample noise around 0
+
+    # Unnormalized area over fraction is O(n * rate), not O(n²) like old metric
+    q_raw = qini_auc_score(y, oracle, t, normalize=False)
+    assert abs(q_raw) < len(y)  # previously was ~n² scale (~1e6)
+    assert abs(q_raw) > 1.0  # still a real positive area for structured data
 
 
 def test_uplift_by_percentile_shape():

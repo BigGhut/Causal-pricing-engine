@@ -1,4 +1,4 @@
-.PHONY: install demo train train-dpe evaluate serve test lint smoke smoke-dpe smoke-local
+.PHONY: install demo proof train train-dpe evaluate serve test lint smoke smoke-dpe smoke-local
 
 install:
 	pip install -r requirements.txt
@@ -6,6 +6,9 @@ install:
 
 demo:
 	python scripts/demo.py
+
+proof:
+	python scripts/portfolio_proof.py
 
 train:
 	python scripts/train.py
