@@ -126,7 +126,7 @@ python scripts/portfolio_proof.py --with-dpe
 Без Make те же скрипты вызываются через `python scripts/...`.  
 Для `make lint` нужен `ruff` (`pip install -e ".[dev]"`).
 
-**Дальше читать:** [CASE_STUDY.md](CASE_STUDY.md) · [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md) · [репозиторий DPE](https://github.com/BigGhut/Dynamic-pricing-engine) (локально: `CAUSAL.md` рядом с DPE)
+**Дальше читать:** [CASE_STUDY.md](CASE_STUDY.md) · [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md) · [DPE](https://github.com/BigGhut/Dynamic-pricing-engine) · [CAUSAL.md в DPE](https://github.com/BigGhut/Dynamic-pricing-engine/blob/main/CAUSAL.md)
 
 ---
 
@@ -264,7 +264,7 @@ causal-pricing-engine/
 ## Процесс и ссылки
 
 - Архив multi-agent handoff/audit: [`docs/archive/`](docs/archive/README.md)  
-- Интеграция с DPE: [Dynamic-pricing-engine](https://github.com/BigGhut/Dynamic-pricing-engine) · локально `../dynamic-pricing-engine/CAUSAL.md` (на remote может ещё не быть запушен)  
+- Интеграция с DPE: [Dynamic-pricing-engine](https://github.com/BigGhut/Dynamic-pricing-engine) · [CAUSAL.md](https://github.com/BigGhut/Dynamic-pricing-engine/blob/main/CAUSAL.md)  
 - Case study: [CASE_STUDY.md](CASE_STUDY.md)  
 - Evidence: [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md)
 
