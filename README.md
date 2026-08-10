@@ -1,141 +1,271 @@
 # Causal Pricing Engine (CPE)
 
-Causal Pricing Engine (CPE) is a **Causal ML & Uplift Modeling** microservice designed to evaluate Individual Treatment Effects (ITE) for dynamic pricing and discount allocation. Trained on simulation logs from its companion project, the [Dynamic Pricing Engine (DPE)](../dynamic-pricing-engine), CPE scores customer uplift in real-time to suppress dynamic surge multipliers for sensitive segments ("Sleeping Dogs") while optimizing incremental conversion and driver payouts.
+**Одной строкой:** sidecar на Causal ML / uplift, который оценивает индивидуальный эффект воздействия (ITE) и подсказывает Dynamic Pricing Engine (DPE), **кому не стоит давать агрессивный surge**.
+
+Стек: Python ≥ 3.10 · scikit-learn · FastAPI · (опц.) EconML · Docker
+
+Репозиторий: [BigGhut/Causal-pricing-engine](https://github.com/BigGhut/Causal-pricing-engine)  
+Компаньон: [BigGhut/Dynamic-pricing-engine](https://github.com/BigGhut/Dynamic-pricing-engine)
+
+---
+
+## Что это / что это не
+
+**Это:**
+
+- микросервис uplift-скоринга (`POST /predict_uplift`, порт `:8100`);
+- связка с DPE: timeout ≤ 200 ms, **fail-open** (если CPE недоступен — обычное rule-based ценообразование);
+- правило **Sleeping Dog**: при \(\hat\tau(x) < -\theta\) (по умолчанию \(\theta = 0.05\)) DPE сбрасывает surge к базовому тарифу (`CAUSAL_NO_SURGE`);
+- честное демо и portfolio-proof: роли берутся с реальных holdout-строк, evidence пишется в `docs/evidence/`.
+
+**Это не:**
+
+- не claim city-scale lift с продакшен A/B;
+- не «магический AUC 0.99» на декоративных фичах;
+- дефолтное демо — **синтетика с заложенным HTE** (heterogeneous treatment effect): показывает пайплайн и политику, а не городской эффект.
+
+Подробный разбор задачи, trade-off и оговорок: [CASE_STUDY.md](CASE_STUDY.md).
 
 ---
 
 ## Почему не классический ML?
 
-Классические модели supervised learning оценивают уровень конверсии $P(Y=1 \mid X, T)$. Они не отделяют тех, кто конвертируется **и без** стимула, от тех, чьё поведение **реально меняется** из‑за воздействия (скидка, surge и т.п.).
+Классический supervised ML отвечает: «какая вероятность конверсии *при этих фичах и treatment?*»  
+\(P(Y=1 \mid X, T)\)
 
-Uplift-моделирование напрямую оценивает **индивидуальный эффект воздействия (ITE)**:
-$$\tau(x) = \mathbb{E}[Y^{(1)} - Y^{(0)} \mid X = x]$$
+Проблема: в одну кучу попадают:
 
-где $Y^{(1)}$ — исход при treatment (например, скидка или surge-надбавка), $Y^{(0)}$ — исход без воздействия (control), а $\tau(x)$ — **чистый прирост**, который можно отнести именно к treatment.
+| Группа | Поведение | Если всегда «лечить» treatment’ом |
+|:---|:---|:---|
+| **Persuadables** | конвертятся *из‑за* воздействия | правильный spend |
+| **Sure things / lost causes** | исход тот же с treatment и без | зря потраченный стимул |
+| **Sleeping Dogs** | воздействие *вредит* (отказ, churn) | активный ущерб |
 
-> **Оговорки и границы claim.** Дефолтное демо использует **синтетику с заложенным HTE**: оно показывает механику пайплайна и правила политики, а **не** city-scale lift в проде. Коэффициент Qini — **нормализованный** ($\approx [-1, 1]$, random null $\approx 0$). Логи симуляции DPE — observational / switchback-данные с возможным post-treatment entanglement признаков (см. `CASE_STUDY.md`).
+Uplift / causal ML целится в **чистый прирост** — индивидуальный эффект воздействия (ITE):
+
+\[
+\tau(x) = \mathbb{E}[Y^{(1)} - Y^{(0)} \mid X = x]
+\]
+
+- \(Y^{(1)}\) — исход *с* воздействием (скидка / surge-бонус),
+- \(Y^{(0)}\) — исход *без* воздействия (control),
+- \(\tau(x)\) — то, что можно отнести именно к treatment.
+
+**Аналогия:** классика говорит «человеку куртка влезет», uplift — «ему *нужна* именно эта куртка, или без неё всё равно / хуже».
+
+> **Границы claim.** Qini в отчётах — **нормализованный** (\(\approx [-1, 1]\), random \(\approx 0\)). Логи симуляции DPE — observational / switchback, возможна post-treatment запутанность признаков (см. case study).
 
 ---
 
-## System Architecture
+## Архитектура
 
 ```text
                                 +-------------------------------+
                                 |  Dynamic Pricing Engine (DPE) |
-                                |       FastAPI on port :8000   |
+                                |       FastAPI  :8000          |
                                 +---------------+---------------+
                                                 |
                                     POST /predict_uplift
-                                  (timeout <= 200ms, fail-open)
+                                  (timeout ≤ 200ms, fail-open)
                                                 |
                                                 v
 +-----------------------+       +---------------+---------------+
 |  DriverHistoryStore   | ----> |  Causal Pricing Engine (CPE)  |
-| (Train/Serve Parity)  |       |       FastAPI on port :8100   |
+| (train/serve parity)  |       |       FastAPI  :8100          |
 +-----------------------+       +---------------+---------------+
                                                 |
                                         [T-Learner / DML]
                                                 |
                                                 v
-                                 Returns ITE score & treatment
+                                 ITE-score + recommended_treatment
 ```
 
----
+### Ключевые идеи
 
-## Key Architectural Ideas
-
-- **Persuadables vs. Sleeping Dogs**:
-  - *Persuadables ($\tau(x) > 0$)*: Users who convert specifically because of treatment (offered targeted discount/surge bonus).
-  - *Sleeping Dogs ($\tau(x) < 0$)*: Sensitive users whose conversion/acceptance drops under surge pricing.
-- **Sleeping Dog Override**: When DPE detects a negative uplift score below threshold ($\tau(x) < -0.05$), it automatically overrides the surge pricing to base fare (`CAUSAL_NO_SURGE`), protecting user retention.
-- **Fail-Open Resilience**: All calls from DPE to CPE feature strict HTTP timeouts ($\le 200\text{ms}$). If CPE is offline or slow, DPE safely falls back to standard rule-based pricing without blocking requests.
-- **Train/Serve Parity**: Features such as `past_trips` and `avg_surge` use strict point-in-time state (as-of prior trip) in both offline dataset generation (`load_dpe_data`) and online feature tracking (`DriverHistoryStore`).
+- **Persuadables** (\(\tau > 0\)) — treatment помогает; **Sleeping Dogs** (\(\tau < 0\)) — treatment вредит.
+- **Sleeping Dog override** в DPE: \(\hat\tau < -0.05\) → base fare, `CAUSAL_NO_SURGE`.
+- **Fail-open:** CPE лежит или тормозит — DPE не блокирует выдачу цены.
+- **Train/serve parity:** `past_trips`, `avg_surge` считаются *as-of prior trip* и офлайн (`load_dpe_data`), и онлайн (`DriverHistoryStore`).
 
 ---
 
-## Quick Start
+## Быстрый старт
+
+Нужен **Python ≥ 3.10**. Команды ниже работают в PowerShell, cmd и bash (Make опционален).
 
 ```powershell
-# 1. Install lightweight dependencies
+cd causal-pricing-engine
 pip install -r requirements.txt
 pip install -e .
 
-# 2. Honest in-process demo (labels match score signs)
+# Честное in-process демо (роли = знаки score на holdout)
 python scripts/demo.py
 
-# 3. Portfolio proof: live CPE HTTP + DPE policy rule → docs/evidence/
+# Portfolio proof: живой HTTP CPE + то же правило, что у DPE → docs/evidence/
 python scripts/portfolio_proof.py
-# make proof
-
-# 4. (Optional) Dual service stack + proof against live DPE
-# Terminal 1: uvicorn src.api.main:app --port 8100
-# Terminal 2: cd ../dynamic-pricing-engine && uvicorn src.api.main:app --port 8000
-# python scripts/portfolio_proof.py --with-dpe
+# или: make proof
 ```
 
-Makefile: `make demo`, `make proof`, `make train`, `make test`, `make smoke-local`.
+Опционально:
 
-**Read next:** [CASE_STUDY.md](CASE_STUDY.md) (problem → approach → trade-offs) · [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md) (captured JSON after `make proof`).
+```powershell
+# Тяжёлый causal-стек (EconML, CatBoost, LightGBM)
+pip install -e ".[causal]"
+
+# Сервис CPE
+uvicorn src.api.main:app --host 0.0.0.0 --port 8100
+# make serve
+
+# Два сервиса + proof против live DPE
+# Терминал 1: uvicorn src.api.main:app --port 8100
+# Терминал 2: cd ../dynamic-pricing-engine && uvicorn src.api.main:app --port 8000
+python scripts/portfolio_proof.py --with-dpe
+```
+
+Полезные цели Makefile: `make install` · `make demo` · `make proof` · `make train` · `make test` · `make smoke-local`.  
+Без Make те же скрипты вызываются через `python scripts/...`.  
+Для `make lint` нужен `ruff` (`pip install -e ".[dev]"`).
+
+**Дальше читать:** [CASE_STUDY.md](CASE_STUDY.md) · [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md) · [репозиторий DPE](https://github.com/BigGhut/Dynamic-pricing-engine) (локально: `CAUSAL.md` рядом с DPE)
 
 ---
 
-## Honest Demo & Proof
+## Пример метрик (captured evidence)
 
-### Demo (`scripts/demo.py`)
+Источник: автогенерация `scripts/portfolio_proof.py` от **2026-08-09 11:04:40 UTC**  
+файл: [`docs/evidence/latest_proof.md`](docs/evidence/latest_proof.md) — **не** ручной маркетинг.
 
-Does **not** invent decorative feature vectors. Scores holdout and picks three **real rows**:
+| Сигнал | Значение |
+|:---|:---|
+| Порог политики | ±0.05 |
+| Holdout Qini (нормализованный) | **+0.0838** (random null +0.0092) |
+| Holdout Uplift@30% | **+0.2302** |
+| Модель в proof | `t_learner` · source `portfolio_proof_synthetic_hte` |
+| Sleeping Dog (пример) | \(\hat\tau \approx -0.415\) → `causal_override = true` |
 
-| Role | Selection rule | Policy at ±0.05 |
+Интерпретация узкая: *на данных с HTE мы умеем скорить ITE, провести через HTTP и применить то же override-правило, что DPE — без падения ценового пути при недоступности модели.*
+
+---
+
+## Честное демо и proof
+
+### Демо (`scripts/demo.py`)
+
+Не рисует декоративные векторы фичей. Скорит holdout и выбирает **три реальные строки**:
+
+| Роль | Как выбираем | Политика при ±0.05 |
 |:---|:---|:---|
-| **persuadable** | max τ̂ | apply treatment |
-| **neutral** | τ̂ ≈ 0 | baseline fare |
-| **sleeping_dog** | min τ̂ | suppress surge |
+| **persuadable** | max \(\hat\tau\) | применить treatment |
+| **neutral** | \(\hat\tau \approx 0\) | baseline |
+| **sleeping_dog** | min \(\hat\tau\) | подавить surge |
 
-If both clear +/− HTE cannot be found, the demo **fails** (or retries synthetic) instead of lying.
+Если явных +/− HTE нет — демо **падает** (или уходит в synthetic retry), а не «придумывает» красивую картинку.
 
 ### Proof (`scripts/portfolio_proof.py`)
 
-1. Same honest picks  
-2. Starts CPE if needed  
-3. `POST /predict_uplift` for each role (asserts treatment codes)  
-4. Applies **the same override rule as DPE** (`τ̂ < −θ → causal_override`)  
-5. Writes **captured** output to `docs/evidence/latest_proof.md`  
+1. Те же честные picks  
+2. Поднимает CPE при необходимости  
+3. `POST /predict_uplift` на каждую роль (assert кодов treatment)  
+4. То же правило, что DPE: \(\hat\tau < -\theta \rightarrow\) causal_override  
+5. Пишет captured output в `docs/evidence/latest_proof.md`  
 
-Optional `--with-dpe` records a live `/api/v1/search` (graph features may differ; override there is informative, not asserted).
+`--with-dpe` дополнительно дергает live `/api/v1/search` (graph-фичи могут отличаться; override там информативный, не жёсткий assert).
+
 ---
 
-## Project Layout
+## API (эскиз)
+
+Сервис: FastAPI `:8100`  
+Liveness: `GET /health`
+
+### `POST /predict_uplift`
+
+**Request:**
+
+```json
+{
+  "user_id": "u_42",
+  "features": {
+    "distance_km": 7.0,
+    "duration_sec": 900.0,
+    "price": 350.0,
+    "surge_bonus": 50.0,
+    "hour_of_day": 18.0,
+    "past_trips": 12.0,
+    "avg_surge": 1.25
+  }
+}
+```
+
+**Response (пример формы):**
+
+```json
+{
+  "user_id": "u_42",
+  "uplift_score": 0.6899,
+  "recommended_treatment": "DISCOUNT_10_PCT",
+  "optimal_discount_pct": 10.0,
+  "model_name": "t_learner"
+}
+```
+
+Коды `recommended_treatment` (порог по умолчанию 0.05):
+
+| Условие | Код | Смысл |
+|:---|:---|:---|
+| \(\hat\tau > +\theta\) | `DISCOUNT_10_PCT` | treatment / скидочный путь |
+| \(\|\hat\tau\| \le \theta\) | `NO_DISCOUNT` | нейтрально |
+| \(\hat\tau < -\theta\) | `NO_DISCOUNT_AVOID` | Sleeping Dog — избегать стимула / surge |
+
+Перед первым serve: `python scripts/train.py` (артефакт в `artifacts/`).
+
+---
+
+## Структура проекта
 
 ```text
 causal-pricing-engine/
-├── artifacts/              # Serialized model joblib payloads
-├── configs/                # System configuration (config.yaml)
-├── docs/archive/           # Historical multi-agent build notes & audits
+├── artifacts/                 # joblib-модели (игнорируются git, кроме .gitkeep)
+├── configs/                   # config.yaml
+├── docs/
+│   ├── archive/               # handoff / audit / multi-agent процесс
+│   └── evidence/              # captured proof (latest_proof.md)
 ├── scripts/
-│   ├── demo.py             # Self-contained in-process demo
-│   ├── train.py            # Model training & candidate selection CLI
-│   └── e2e_smoke.py        # End-to-end service integration verifier
+│   ├── demo.py                # честное in-process демо
+│   ├── portfolio_proof.py     # HTTP + evidence для портфолио
+│   ├── train.py               # обучение и выбор кандидата
+│   ├── e2e_smoke.py           # e2e / smoke
+│   ├── evaluate_experiment.py # offline eval (в т.ч. DPE source)
+│   └── diagnostics_leakage.py # диагностика leakage
 ├── src/
-│   ├── api/main.py         # FastAPI service (port :8100)
-│   ├── causal/             # Uplift meta-learners & DML engine
-│   ├── data/               # Unified feature contract & DPE SQLite connector
-│   └── evaluation/         # Qini curve & Uplift@k metrics
-├── tests/                  # Pytest verification suite
-├── Makefile                # Command shortcuts
-└── pyproject.toml          # Package configuration & optional deps
+│   ├── api/main.py            # FastAPI :8100
+│   ├── causal/                # meta-learners, DML
+│   ├── data/                  # feature contract, DPE connector, synthetic
+│   ├── evaluation/            # Qini, Uplift@k
+│   └── experiments/           # switchback / power helpers
+├── tests/
+├── CASE_STUDY.md
+├── Dockerfile / docker-compose*.yml
+├── Makefile
+├── pyproject.toml
+└── requirements.txt
 ```
 
 ---
 
-## What I'd Improve Next
+## Что улучшил бы дальше
 
-1. Larger switchback logs + CUPED readout of the override policy (not only Qini on holdout).  
-2. Multi-treatment (surge levels / discount depths) instead of binary treat/control.  
-3. Shared online feature store so graph features under load match offline training columns.
+1. Больше switchback-логов + CUPED-readout политики override (не только Qini на holdout).  
+2. Multi-treatment (уровни surge / глубины скидки), а не binary treat/control.  
+3. Общий online feature store, чтобы graph-фичи под нагрузкой совпадали с offline training columns.
 
 ---
 
-## Process archive
+## Процесс и ссылки
 
-Multi-agent handoffs and audits: [`docs/archive/`](docs/archive/README.md).  
-DPE integration notes: [`CAUSAL.md`](../dynamic-pricing-engine/CAUSAL.md).
+- Архив multi-agent handoff/audit: [`docs/archive/`](docs/archive/README.md)  
+- Интеграция с DPE: [Dynamic-pricing-engine](https://github.com/BigGhut/Dynamic-pricing-engine) · локально `../dynamic-pricing-engine/CAUSAL.md` (на remote может ещё не быть запушен)  
+- Case study: [CASE_STUDY.md](CASE_STUDY.md)  
+- Evidence: [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md)
+
+Локально компаньон обычно лежит рядом: `../dynamic-pricing-engine` (на GitHub — отдельный public-репо по ссылке выше).
