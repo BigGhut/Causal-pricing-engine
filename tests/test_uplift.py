@@ -241,27 +241,44 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     assert qini > qini_random - 0.05
 
 
-def test_artifact_records_flag_threshold_and_false_override_rate(tmp_path: Path):
-    import joblib
+def test_operating_point_maximizes_caught_dogs_under_the_false_rate_cap():
+    from src.evaluation.portfolio_eval import choose_operating_point, operating_curve
 
-    from src.evaluation.metrics import false_override_rate, holdout_decision
+    scores = np.array([-0.40, -0.30, -0.05, 0.10, 0.20, 0.30])
+    truth = np.array([-0.12, 0.00, 0.00, 0.00, 0.25, -0.12])
+    curve = operating_curve(scores, truth)
+    chosen = choose_operating_point(curve)
+    assert chosen is not None
+    assert float(chosen["false_override_rate"]) <= 0.10
+    assert float(chosen["caught_rate"]) == pytest.approx(0.5)
+    assert int(chosen["n_fired"]) >= 1
+    never = [row for row in curve if int(row["n_fired"]) == 0]
+    assert never
+    assert all(float(row["caught_rate"]) == 0.0 for row in never)
+
+
+def test_artifact_records_flag_threshold_and_false_override_rate(tmp_path: Path):
+    from src.evaluation.portfolio_eval import choose_operating_point, operating_curve
     from src.evaluation.protocol import FALSE_OVERRIDE_RATE_MAX
 
-    scores = np.array([-0.2, -0.08, 0.1])
-    truth = np.array([0.25, -0.12, 0.0])
-    rate = false_override_rate(scores, truth, threshold=0.05)
-    decision = holdout_decision(
-        0.3,
-        false_override_rate=rate,
-        false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
-    )
+    scores = np.array([-0.40, -0.30, 0.20])
+    truth = np.array([-0.12, 0.00, -0.12])
+    chosen = choose_operating_point(operating_curve(scores, truth))
+    payload = {
+        "ranking_supports_decision": chosen is not None,
+        "false_override_rate": None if chosen is None else chosen["false_override_rate"],
+        "false_override_rate_max": FALSE_OVERRIDE_RATE_MAX,
+        "score_threshold": None if chosen is None else chosen["theta"],
+        "calibration_caught_rate": None if chosen is None else chosen["caught_rate"],
+    }
     path = tmp_path / "model.joblib"
-    joblib.dump({"metrics": decision}, path)
-    metrics = joblib.load(path)["metrics"]
-    assert "ranking_supports_decision" in metrics
-    assert metrics["false_override_rate_max"] == pytest.approx(0.10)
-    assert metrics["false_override_rate"] == pytest.approx(0.5)
-    assert metrics["ranking_supports_decision"] is False
+    joblib.dump({"metrics": payload}, path)
+    stored = joblib.load(path)["metrics"]
+    assert "ranking_supports_decision" in stored
+    assert stored["false_override_rate_max"] == pytest.approx(0.10)
+    assert "false_override_rate" in stored
+    assert "score_threshold" in stored
+    assert stored["score_threshold"] is not None
 
 
 def test_holdout_splits_into_disjoint_calibration_and_test():

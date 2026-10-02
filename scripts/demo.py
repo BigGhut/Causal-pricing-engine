@@ -36,10 +36,8 @@ from src.data.synthetic import (
     generate_uplift_dataset,
     summarize_calibration,
 )
-from src.evaluation.protocol import FALSE_OVERRIDE_RATE_MAX
+from src.evaluation.portfolio_eval import choose_operating_point, operating_curve, rates_at_theta
 from src.evaluation.metrics import (
-    false_override_rate,
-    holdout_decision,
     qini_bootstrap_interval,
     qini_random_interval,
     split_train_calibration_test,
@@ -238,27 +236,36 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
     cal_uplift = model.predict_uplift(X_cal)
     test_uplift = model.predict_uplift(X_test)
     cal_qini = qini_bootstrap_interval(y_cal, cal_uplift, t_cal, n_boot=200, seed=0)
-    decision = holdout_decision(
-        float(cal_qini["low"]),
-        false_override_rate=false_override_rate(
-            cal_uplift,
-            df["true_uplift"].to_numpy()[idx_cal],
-            threshold=threshold,
-        ),
-        false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
+    chosen = choose_operating_point(operating_curve(cal_uplift, df["true_uplift"].to_numpy()[idx_cal]))
+    checked = None if chosen is None else rates_at_theta(
+        test_uplift, df["true_uplift"].to_numpy()[idx_test], float(chosen["theta"])
     )
+    flag = (
+        checked is not None
+        and int(checked["n_fired"]) >= 1
+        and checked["false_override_rate"] is not None
+        and float(checked["false_override_rate"]) <= 0.10
+    )
+    decision = {
+        "ranking_supports_decision": flag,
+        "false_override_rate": None if chosen is None else chosen["false_override_rate"],
+        "false_override_rate_max": 0.10,
+        "score_threshold": None if chosen is None else float(chosen["theta"]),
+        "calibration_caught_rate": None if chosen is None else chosen["caught_rate"],
+    }
     qini = qini_bootstrap_interval(y_test, test_uplift, t_test, n_boot=200, seed=1)
     qini_null = qini_random_interval(y_test, t_test, n_draws=200, seed=2)
     u_at_30 = uplift_at_k(y_test, test_uplift, t_test, k=0.3)
     print(
         f"[*] Calibration Qini (sets the flag, n={len(idx_cal)}): {cal_qini['point']:+.4f}  "
         f"95% [{cal_qini['low']:+.4f}, {cal_qini['high']:+.4f}]  "
-        f"ranking_supports_decision={decision['ranking_supports_decision']}"
+        f"ranking_supports_decision={decision['ranking_supports_decision']} "
+        f"θ*={decision['score_threshold']}"
     )
     if not decision["ranking_supports_decision"]:
         print(
-            "[*] The calibration lower bound is not above 0, so a score below "
-            "-0.05 does not change the fare."
+            "[*] No confirmed operating point: the fare is not changed. "
+            "Qini above is the ranking, not the decision."
         )
     print(
         f"[*] Untouched test Qini (n={len(idx_test)}): {qini['point']:+.4f}  "

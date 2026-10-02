@@ -85,6 +85,12 @@ def _start_cpe() -> subprocess.Popen:
     return proc
 
 
+def _theta(value: float | None) -> str:
+    if value is None:
+        return "none"
+    return f"{float(value):.2f}"
+
+
 def _fmt(value: float | None, digits: int = 4) -> str:
     if value is None:
         return "undefined"
@@ -172,11 +178,13 @@ def train_and_pick(
         "uplift_at_k": primary["uplift_at_k"],
         "calibration": primary["segments"],
         "ranking_supports_decision": primary["ranking_supports_decision"],
+        "score_threshold": primary["score_threshold"],
         "false_override_rate": primary["false_override_rate"],
+        "calibration_caught_rate": primary["calibration_caught_rate"],
         "false_override_rate_max": primary["false_override_rate_max"],
-        "false_override_check": primary["false_override_check"],
         "pehe": primary["pehe"],
         "test_false_override_rate": primary["test_false_override_rate"],
+        "test_caught_rate": primary["test_caught_rate"],
         "deciles": primary["deciles"],
         "n": n,
         "split_seed": SPLIT_SEED,
@@ -191,7 +199,10 @@ def train_and_pick(
             "ranking_supports_decision": primary["ranking_supports_decision"],
             "false_override_rate": primary["false_override_rate"],
             "false_override_rate_max": FALSE_OVERRIDE_RATE_MAX,
-            "false_override_check": primary["false_override_check"],
+            "score_threshold": primary["score_threshold"],
+            "calibration_caught_rate": primary["calibration_caught_rate"],
+            "test_false_override_rate": primary["test_false_override_rate"],
+            "test_caught_rate": primary["test_caught_rate"],
             "calibration_qini_low": primary["calibration_qini_low"],
             "calibration_qini_high": primary["calibration_qini_high"],
             "qini_auc": primary["test_qini"],
@@ -213,21 +224,24 @@ def dpe_policy_from_uplift(
     threshold: float,
     *,
     ranking_supports_decision: bool = False,
+    score_threshold: float | None = None,
 ) -> dict[str, Any]:
-    """Mirror the DPE rule for this one treatment.
+    """Mirror the DPE rule.
 
-    A score below -threshold drops the additive surcharge only when the
-    holdout Qini interval lies entirely above zero. Otherwise the cut follows
-    a ranking that is not separated from noise, and the surcharge stays.
+    The fare changes only when the flag is true and the score is below the
+    threshold chosen on calibration. A missing threshold does not fall back
+    to 0.05.
     """
     treatment = recommend_treatment(uplift, threshold=threshold)
-    score_says_drop = uplift < -threshold
+    score_says_drop = (
+        score_threshold is not None and uplift < -float(score_threshold)
+    )
     override = score_says_drop and ranking_supports_decision
     if override:
         action = "charge the base fare and drop the additive surcharge"
     elif score_says_drop:
         action = (
-            "score is below the threshold, but the Qini interval covers 0, "
+            "score is below the chosen threshold, but the flag is false, "
             "so the surcharge stays"
         )
     elif treatment == "SURCHARGE":
@@ -238,6 +252,7 @@ def dpe_policy_from_uplift(
         "causal_uplift_score": uplift,
         "causal_override": override,
         "ranking_supports_decision": ranking_supports_decision,
+        "score_threshold": score_threshold,
         "causal_recommended_treatment": treatment,
         "test_group_if_dpe": "CAUSAL_NO_SURGE" if override else "ADDITIVE",
         "pricing_action": action,
@@ -315,7 +330,10 @@ def run_proof(
 
             supports = read_ranking_supports_decision(metrics)
             policy = dpe_policy_from_uplift(
-                score, threshold, ranking_supports_decision=supports
+                score,
+                threshold,
+                ranking_supports_decision=supports,
+                score_threshold=metrics.get("score_threshold"),
             )
             print(
                 f"    [{sc.role}] τ̂={score:+.4f} → {treatment} | "
@@ -428,16 +446,45 @@ def _tlearner_conclusion(records: list[dict[str, Any]]) -> str:
             "On these five seeds the untouched-test Qini interval for the T-learner "
             "stays above 0."
         )
-    flags_false = t_rows and not any(row["ranking_supports_decision"] for row in t_rows)
-    if flags_false:
-        return (
-            qini_text
-            + " The decision flag is false on every T-learner seed in this table. "
-            "Where the calibration Qini lower bound is above 0, the false-override "
-            "rate is still above the pre-registered maximum 0.10, so the rate check fails. "
-            "Under the rule in PLAN.md this T-learner does not change the fare."
+    feasible = [row for row in t_rows if row["score_threshold"] is not None]
+    confirmed = [row for row in t_rows if row["ranking_supports_decision"]]
+    if not feasible:
+        decision_text = (
+            " No calibration grid point kept the false-override rate at or below 0.10 "
+            "while firing at least once. There is no operating threshold. The flag is false."
         )
-    return qini_text
+    elif not confirmed:
+        decision_text = (
+            f" Calibration found a threshold on {len(feasible)} of {len(t_rows)} T-learner seeds. "
+            "The untouched test did not keep the false-override rate at or below 0.10 "
+            "at that frozen threshold, so the flag is false. The threshold was not refit on the test."
+        )
+    else:
+        bits = ", ".join(
+            f"seed {row['generation_seed']} θ*={float(row['score_threshold']):.2f} "
+            f"test false={float(row['test_false_override_rate']):.4f} "
+            f"test caught={float(row['test_caught_rate']):.4f}"
+            for row in confirmed
+        )
+        decision_text = (
+            f" The flag is true on {len(confirmed)} of {len(t_rows)} T-learner seeds: {bits}. "
+            "The other seeds stay in the table and are not replaced by these."
+        )
+    thin = [
+        row
+        for row in feasible
+        if row["calibration_caught_rate"] is not None
+        and float(row["calibration_caught_rate"]) < 0.05
+    ]
+    if thin:
+        thin_bits = ", ".join(
+            f"seed {row['generation_seed']} caught {float(row['calibration_caught_rate']):.4f}"
+            for row in thin
+        )
+        decision_text += (
+            f" A calibration point that barely catches sleeping dogs is not useful: {thin_bits}."
+        )
+    return qini_text + decision_text
 
 
 def _write_evidence(
@@ -478,32 +525,26 @@ def _write_evidence(
         "",
         "## All five seeds",
         "",
-        "| Seed | Learner | Cal Qini | Cal 95% | Cal false rate | Flag | Test Qini | Test 95% | Random 95% | PEHE | Bias +0.25 | Bias 0 | Bias −0.12 | Test false rate |",
-        "|:---|:---|---:|:---|---:|:---|---:|:---|:---|---:|---:|---:|---:|---:|",
+        "| Seed | Learner | θ* | Cal false | Cal caught | Test false | Test caught | Flag | Test Qini | Test 95% | PEHE |",
+        "|:---|:---|---:|---:|---:|---:|---:|:---|---:|:---|---:|",
     ]
     for record in records:
         segments = {row["segment"]: row for row in record["segments"]}
         lines.append(
-            "| {seed} | {learner} | {cq:+.4f} | [{cl:+.4f}, {ch:+.4f}] | {crate} | {flag} | "
-            "{tq:+.4f} | [{tl:+.4f}, {th:+.4f}] | [{rl:+.4f}, {rh:+.4f}] | {pehe:.4f} | "
-            "{bpos} | {bzero} | {bneg} | {trate} |".format(
+            "| {seed} | {learner} | {theta} | {cfalse} | {ccaught} | {tfalse} | {tcaught} | {flag} | "
+            "{tq:+.4f} | [{tl:+.4f}, {th:+.4f}] | {pehe:.4f} |".format(
                 seed=record["generation_seed"],
                 learner=record["learner"],
-                cq=record["calibration_qini"],
-                cl=record["calibration_qini_low"],
-                ch=record["calibration_qini_high"],
-                crate=_rate_cell(record["false_override_rate"]),
+                theta=_theta(record["score_threshold"]),
+                cfalse=_rate_cell(record["false_override_rate"]),
+                ccaught=_rate_cell(record["calibration_caught_rate"]),
+                tfalse=_rate_cell(record["test_false_override_rate"]),
+                tcaught=_rate_cell(record["test_caught_rate"]),
                 flag=str(record["ranking_supports_decision"]).lower(),
                 tq=record["test_qini"],
                 tl=record["test_qini_low"],
                 th=record["test_qini_high"],
-                rl=record["random_qini_low"],
-                rh=record["random_qini_high"],
                 pehe=record["pehe"],
-                bpos=_fmt(_segment_bias(record["segments"], "persuadable")),
-                bzero=_fmt(_segment_bias(record["segments"], "neutral")),
-                bneg=_fmt(_segment_bias(record["segments"], "sleeping_dog")),
-                trate=_rate_cell(record["test_false_override_rate"]),
             )
         )
         del segments
@@ -523,9 +564,11 @@ def _write_evidence(
             f"- Calibration Qini `{metrics['calibration_qini']:+.4f}`, "
             f"95% `[{metrics['calibration_qini_low']:+.4f}, {metrics['calibration_qini_high']:+.4f}]` "
             f"on {metrics['calibration_qini_boot']} resamples. "
-            f"False-override rate `{_rate_cell(metrics['false_override_rate'])}` "
-            f"against maximum `{metrics['false_override_rate_max']}`. "
-            f"Check `{metrics['false_override_check']}`. "
+            f"Chosen θ* `{_theta(metrics['score_threshold'])}`. "
+            f"Calibration false rate `{_rate_cell(metrics['false_override_rate'])}`, "
+            f"caught rate `{_rate_cell(metrics['calibration_caught_rate'])}`. "
+            f"Test false rate `{_rate_cell(metrics['test_false_override_rate'])}`, "
+            f"test caught rate `{_rate_cell(metrics['test_caught_rate'])}`. "
             f"Flag `{str(metrics['ranking_supports_decision']).lower()}`.",
             f"- Untouched-test Qini `{metrics['qini_auc']:+.4f}`, "
             f"95% `[{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]` "
@@ -556,6 +599,27 @@ def _write_evidence(
         "",
         ]
     )
+    lines.extend(["## Calibration curve: false rate against caught rate", "",
+        "Each row is one θ on the grid 0.00, 0.01, …, 0.50.",
+        "Override means score < −θ. Caught rate is the share of rows with true_uplift < 0 that the override hits.",
+        "The chosen mark is the calibration rule. The untouched test is not used to place that mark.",
+        ""])
+    for record in records:
+        lines.append(f"### Seed `{record['generation_seed']}`, `{record['learner']}`")
+        lines.append("")
+        lines.append("| θ | n fired | false rate | caught rate | chosen |")
+        lines.append("|---:|---:|---:|---:|:---|")
+        chosen_theta = record["score_threshold"]
+        for point in record["calibration_curve"]:
+            mark = ""
+            if chosen_theta is not None and abs(float(point["theta"]) - float(chosen_theta)) < 1e-9:
+                mark = "yes"
+            lines.append(
+                f"| {float(point['theta']):.2f} | {int(point['n_fired'])} | "
+                f"{_rate_cell(point['false_override_rate'])} | "
+                f"{_rate_cell(point['caught_rate'])} | {mark} |"
+            )
+        lines.append("")
     lines.extend(["## Deciles on the untouched test", "",
         "Decile 1 has the lowest predicted scores. Decile 10 has the highest.",
         "The observed difference is mean acceptance among treated rows in the decile minus mean acceptance among control rows.",
@@ -620,13 +684,14 @@ def _write_evidence(
     label = sd["http_response"]["recommended_treatment"]
     if override:
         decision = (
-            "DPE would charge the base fare. The calibration flag is true: "
-            "the Qini lower bound is above 0 and the false-override rate is within 0.10."
+            "DPE would charge the base fare because the version-2 flag is true "
+            "at the frozen threshold. A row with true effect at least 0 is one "
+            "of the false overrides still inside the 0.10 cap."
         )
     else:
         decision = (
-            "DPE keeps the surcharge. The calibration flag is false, so a score "
-            "below -0.05 does not change the fare."
+            "DPE keeps the surcharge. The version-2 flag is false, so the score "
+            "does not change the fare."
         )
     lines.extend(
         [

@@ -1,4 +1,8 @@
-"""One pre-registered portfolio split. The calibration slice sets the flag only."""
+"""One pre-registered portfolio split.
+
+Version 2 chooses the score threshold on the calibration curve only.
+The untouched test checks that frozen threshold and does not move it.
+"""
 
 from __future__ import annotations
 
@@ -13,8 +17,6 @@ from src.data.synthetic import (
 )
 from src.evaluation.metrics import (
     decile_calibration,
-    false_override_rate,
-    holdout_decision,
     pehe,
     qini_bootstrap_interval,
     qini_random_interval,
@@ -32,6 +34,77 @@ from src.evaluation.protocol import (
     SPLIT_SEED,
     TEST_BOOT_SEED,
 )
+
+# Fixed before the version-2 run. Not derived from scores.
+THETA_GRID = tuple(i / 100 for i in range(51))
+
+
+def rates_at_theta(
+    scores: np.ndarray,
+    true_uplift: np.ndarray,
+    theta: float,
+) -> dict[str, float | int | None]:
+    """False-override rate and sleeping-dog catch rate at one frozen threshold."""
+    score_arr = np.asarray(scores, dtype=float).ravel()
+    true_arr = np.asarray(true_uplift, dtype=float).ravel()
+    fired = score_arr < -float(theta)
+    dogs = true_arr < 0.0
+    n_fired = int(fired.sum())
+    n_dogs = int(dogs.sum())
+    if n_dogs == 0:
+        caught: float | None = None
+    else:
+        caught = float((fired & dogs).sum() / n_dogs)
+    if n_fired == 0:
+        false_rate: float | None = None
+    else:
+        false_rate = float((fired & (true_arr >= 0.0)).sum() / n_fired)
+    return {
+        "theta": float(theta),
+        "n_fired": n_fired,
+        "false_override_rate": false_rate,
+        "caught_rate": caught,
+    }
+
+
+def operating_curve(
+    scores: np.ndarray,
+    true_uplift: np.ndarray,
+    thetas: tuple[float, ...] = THETA_GRID,
+) -> list[dict[str, float | int | None]]:
+    """Calibration curve. Each point is one pre-registered theta."""
+    return [rates_at_theta(scores, true_uplift, theta) for theta in thetas]
+
+
+def choose_operating_point(
+    curve: list[dict[str, float | int | None]],
+    *,
+    rate_max: float = FALSE_OVERRIDE_RATE_MAX,
+) -> dict[str, float | int | None] | None:
+    """Max sleeping-dog catch rate among points with false rate at most rate_max.
+
+    Points that never fire are not eligible. Ties break toward the smaller
+    false rate, then the smaller theta. The rule is fixed in PLAN.md version 2.
+    """
+    feasible: list[dict[str, float | int | None]] = []
+    for row in curve:
+        n_fired = int(row["n_fired"])
+        false_rate = row["false_override_rate"]
+        caught = row["caught_rate"]
+        if n_fired < 1 or false_rate is None or caught is None:
+            continue
+        if float(false_rate) <= float(rate_max):
+            feasible.append(row)
+    if not feasible:
+        return None
+    feasible.sort(
+        key=lambda row: (
+            -float(row["caught_rate"]),
+            float(row["false_override_rate"]),
+            float(row["theta"]),
+        )
+    )
+    return feasible[0]
 
 
 def _learner(name: str):
@@ -78,15 +151,8 @@ def run_split(
         n_boot=N_BOOT,
         seed=CALIBRATION_BOOT_SEED,
     )
-    rate_cal = false_override_rate(
-        predicted_cal, truth[cal_idx], threshold=threshold
-    )
-    decision = holdout_decision(
-        float(cal_qini["low"]),
-        false_override_rate=rate_cal,
-        false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
-    )
-
+    curve = operating_curve(predicted_cal, truth[cal_idx])
+    chosen = choose_operating_point(curve)
     predicted_test = np.asarray(model.predict_uplift(features[test_idx]), dtype=float)
     test_qini = qini_bootstrap_interval(
         accepted[test_idx],
@@ -106,6 +172,28 @@ def run_split(
     )
     for row in segments:
         row["bias"] = float(row["mean_predicted"]) - float(row["planted"])
+    if chosen is None:
+        score_threshold = None
+        cal_false = None
+        cal_caught = None
+        cal_fired = 0
+        test_at = {
+            "n_fired": 0,
+            "false_override_rate": None,
+            "caught_rate": None,
+        }
+        flag = False
+    else:
+        score_threshold = float(chosen["theta"])
+        cal_false = chosen["false_override_rate"]
+        cal_caught = chosen["caught_rate"]
+        cal_fired = int(chosen["n_fired"])
+        test_at = rates_at_theta(predicted_test, truth[test_idx], score_threshold)
+        flag = (
+            int(test_at["n_fired"]) >= 1
+            and test_at["false_override_rate"] is not None
+            and float(test_at["false_override_rate"]) <= FALSE_OVERRIDE_RATE_MAX
+        )
     return {
         "generation_seed": int(generation_seed),
         "learner": learner_name,
@@ -116,10 +204,13 @@ def run_split(
         "calibration_qini_low": float(cal_qini["low"]),
         "calibration_qini_high": float(cal_qini["high"]),
         "calibration_n_boot": int(cal_qini["n_boot"]),
-        "false_override_rate": decision["false_override_rate"],
-        "false_override_rate_max": decision["false_override_rate_max"],
-        "false_override_check": decision["false_override_check"],
-        "ranking_supports_decision": decision["ranking_supports_decision"],
+        "score_threshold": score_threshold,
+        "calibration_curve": curve,
+        "calibration_n_fired": cal_fired,
+        "false_override_rate": None if cal_false is None else float(cal_false),
+        "calibration_caught_rate": None if cal_caught is None else float(cal_caught),
+        "false_override_rate_max": FALSE_OVERRIDE_RATE_MAX,
+        "ranking_supports_decision": flag,
         "test_qini": float(test_qini["point"]),
         "test_qini_low": float(test_qini["low"]),
         "test_qini_high": float(test_qini["high"]),
@@ -133,9 +224,9 @@ def run_split(
         ),
         "pehe": pehe(predicted_test, truth[test_idx]),
         "segments": segments,
-        "test_false_override_rate": false_override_rate(
-            predicted_test, truth[test_idx], threshold=threshold
-        ),
+        "test_n_fired": int(test_at["n_fired"]),
+        "test_false_override_rate": test_at["false_override_rate"],
+        "test_caught_rate": test_at["caught_rate"],
         "deciles": decile_calibration(
             accepted[test_idx], treatment[test_idx], predicted_test
         ),

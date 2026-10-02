@@ -80,6 +80,18 @@ def score_uplift(features: dict[str, float]) -> float:
     return float(np.asarray(scores).ravel()[0])
 
 
+def _stored_score_threshold() -> float | None:
+    """Threshold chosen on calibration. Missing means the fare is not changed."""
+    metrics = _MODEL_STATE.get("metrics") or {}
+    value = metrics.get("score_threshold")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def recommend_treatment(uplift_score: float, threshold: float | None = None) -> str:
     """Map the surcharge effect to one action.
 
@@ -160,6 +172,7 @@ class PredictUpliftResponse(BaseModel):
     uplift_score: float
     recommended_treatment: str
     ranking_supports_decision: bool
+    score_threshold: float | None = None
     model_name: str | None = None
 
 
@@ -211,6 +224,7 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
         uplift_score=uplift_score,
         recommended_treatment=treatment,
         ranking_supports_decision=read_ranking_supports_decision(_MODEL_STATE.get("metrics")),
+        score_threshold=_stored_score_threshold(),
         model_name=_MODEL_STATE.get("model_name"),
     )
 
