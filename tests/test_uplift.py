@@ -241,13 +241,32 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     assert qini > qini_random - 0.05
 
 
-def test_ranking_gate_requires_the_qini_interval_above_zero():
-    from src.api.main import ranking_supports_decision
+def test_ranking_flag_is_fixed_at_training_and_only_read_at_serve():
+    from src.evaluation.metrics import holdout_decision, read_ranking_supports_decision
 
-    assert ranking_supports_decision({"qini_low": -0.003, "qini_high": 0.116}) is False
-    assert ranking_supports_decision({"qini_low": 0.2, "qini_high": 0.4}) is True
-    assert ranking_supports_decision({}) is False
-    assert ranking_supports_decision(None) is False
+    below = holdout_decision(-0.003)
+    above = holdout_decision(0.2)
+    assert below["ranking_supports_decision"] is False
+    assert above["ranking_supports_decision"] is True
+    assert above["false_override_check"] == "not_applied"
+
+    # A measured rate does not change the flag until a maximum is supplied.
+    recorded = holdout_decision(0.2, false_override_rate=0.9)
+    assert recorded["ranking_supports_decision"] is True
+    assert recorded["false_override_check"] == "not_applied"
+    assert recorded["false_override_rate"] == pytest.approx(0.9)
+
+    blocked = holdout_decision(0.2, false_override_rate=0.4, false_override_rate_max=0.1)
+    allowed = holdout_decision(0.2, false_override_rate=0.05, false_override_rate_max=0.1)
+    assert blocked["ranking_supports_decision"] is False
+    assert blocked["false_override_check"] == "fail"
+    assert allowed["ranking_supports_decision"] is True
+    assert allowed["false_override_check"] == "pass"
+
+    # Serve does not turn qini_low back into a flag.
+    assert read_ranking_supports_decision({"qini_low": 0.3}) is False
+    assert read_ranking_supports_decision({"qini_low": -1.0, "ranking_supports_decision": True}) is True
+    assert read_ranking_supports_decision(None) is False
 
 
 def test_qini_beats_random_when_the_planted_effect_is_large():

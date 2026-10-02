@@ -234,6 +234,43 @@ def uplift_by_percentile(
     return pd.DataFrame(rows)
 
 
+def holdout_decision(
+    qini_low: float,
+    *,
+    false_override_rate: float | None = None,
+    false_override_rate_max: float | None = None,
+) -> dict[str, float | str | bool | None]:
+    """Decide, at training time, whether scores may change a fare.
+
+    The flag is true only when the holdout Qini lower bound is above zero.
+    A false-override rate is stored when it is passed, but it does not affect
+    the flag until a maximum is passed too. That maximum is not set yet.
+    """
+    qini_ok = float(qini_low) > 0.0
+    rate_applied = false_override_rate is not None and false_override_rate_max is not None
+    if not rate_applied:
+        rate_ok = True
+        rate_check = "not_applied"
+    else:
+        rate_ok = float(false_override_rate) < float(false_override_rate_max)
+        rate_check = "pass" if rate_ok else "fail"
+    return {
+        "ranking_supports_decision": bool(qini_ok and rate_ok),
+        "false_override_rate": None if false_override_rate is None else float(false_override_rate),
+        "false_override_rate_max": (
+            None if false_override_rate_max is None else float(false_override_rate_max)
+        ),
+        "false_override_check": rate_check,
+    }
+
+
+def read_ranking_supports_decision(metrics: dict | None) -> bool:
+    """Read the flag written at training. Do not recompute it from ``qini_low``."""
+    if not isinstance(metrics, dict):
+        return False
+    return metrics.get("ranking_supports_decision") is True
+
+
 def qini_bootstrap_interval(
     y: np.ndarray | pd.Series,
     uplift: np.ndarray | pd.Series,

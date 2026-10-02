@@ -22,8 +22,12 @@ from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearn
 from src.config import load_config
 from src.data.dpe_connector import describe_switchback, load_dpe_data
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
-from src.api.main import ranking_supports_decision
-from src.evaluation.metrics import qini_auc_score, qini_bootstrap_interval, uplift_at_k
+from src.evaluation.metrics import (
+    holdout_decision,
+    qini_auc_score,
+    qini_bootstrap_interval,
+    uplift_at_k,
+)
 
 
 def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, random_state: int):
@@ -160,10 +164,12 @@ def train_and_select(
     interval = qini_bootstrap_interval(y_test, best_uplift, t_test, n_boot=200, seed=rs)
     results[best_name]["qini_low"] = float(interval["low"])
     results[best_name]["qini_high"] = float(interval["high"])
-    results[best_name]["ranking_supports_decision"] = ranking_supports_decision(results[best_name])
+    results[best_name].update(holdout_decision(float(interval["low"])))
     if not results[best_name]["ranking_supports_decision"]:
         print(
-            "Holdout Qini interval covers 0 or is missing. "
+            "Training set ranking_supports_decision=false: "
+            "holdout Qini lower bound is not above 0. "
+            "The false-override rate is not applied yet. "
             "A score below -0.05 does not change the fare."
         )
 

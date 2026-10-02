@@ -40,15 +40,20 @@ from scripts.demo import (
     assert_scenario_honesty,
     pick_honest_scenarios,
 )
-from src.api.main import ranking_supports_decision, recommend_treatment
+from src.api.main import recommend_treatment
+from src.evaluation.metrics import (
+    holdout_decision,
+    qini_bootstrap_interval,
+    qini_random_interval,
+    read_ranking_supports_decision,
+    uplift_at_k,
+)
 from src.causal.uplift_models import TLearner
 from src.data.synthetic import (
     format_calibration,
     generate_uplift_dataset,
     summarize_calibration,
 )
-from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval, uplift_at_k
-
 EVIDENCE_PATH = _ROOT / "docs" / "evidence" / "latest_proof.md"
 
 
@@ -124,6 +129,7 @@ def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, An
         "qini_random_draws": int(qini_null["n_draws"]),
         "uplift_at_k": float(uplift_at_k(y_va, u_va, t_va, k=0.3)),
         "calibration": calibration,
+        **holdout_decision(float(qini["low"])),
     }
     scenarios = pick_honest_scenarios(
         X_va,
@@ -241,7 +247,7 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
                 print(f"[FAIL] neutral unexpected treatment={treatment}")
                 return 1
 
-            supports = ranking_supports_decision(metrics)
+            supports = read_ranking_supports_decision(metrics)
             policy = dpe_policy_from_uplift(
                 score, threshold, ranking_supports_decision=supports
             )

@@ -38,7 +38,12 @@ from src.data.synthetic import (
     generate_uplift_dataset,
     summarize_calibration,
 )
-from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval, uplift_at_k
+from src.evaluation.metrics import (
+    holdout_decision,
+    qini_bootstrap_interval,
+    qini_random_interval,
+    uplift_at_k,
+)
 
 DEFAULT_THRESHOLD = 0.05
 FEATURE_COLS = list(FEATURE_COLUMNS)
@@ -289,6 +294,7 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
                 "qini_low": float(qini["low"]),
                 "qini_high": float(qini["high"]),
                 "uplift_at_k": float(u_at_30),
+                **holdout_decision(float(qini["low"])),
             },
             "uplift_threshold": float(threshold),
         },

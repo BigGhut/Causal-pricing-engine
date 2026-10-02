@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.config import load_config
 from src.data.synthetic import FEATURE_COLUMNS
+from src.evaluation.metrics import read_ranking_supports_decision
 
 # Module-level model state populated at startup
 _MODEL_STATE: dict[str, Any] = {
@@ -77,24 +78,6 @@ def score_uplift(features: dict[str, float]) -> float:
     else:
         raise TypeError(f"Unsupported model type: {type(model)!r}")
     return float(np.asarray(scores).ravel()[0])
-
-
-def ranking_supports_decision(metrics: dict[str, Any] | None) -> bool:
-    """True only when the holdout Qini interval lies entirely above zero.
-
-    A threshold on the score changes the fare only in that case. If the
-    interval covers zero, the score is not separated from a random ranking,
-    and cutting the surcharge at -0.05 follows noise.
-    """
-    if not metrics:
-        return False
-    low = metrics.get("qini_low")
-    if low is None:
-        return False
-    try:
-        return float(low) > 0.0
-    except (TypeError, ValueError):
-        return False
 
 
 def recommend_treatment(uplift_score: float, threshold: float | None = None) -> str:
@@ -190,7 +173,7 @@ def health_check() -> dict[str, Any]:
         "model_name": str(_MODEL_STATE.get("model_name") or ""),
         "source": str(_MODEL_STATE.get("source") or ""),
         "feature_columns": _MODEL_STATE.get("feature_columns", []),
-        "ranking_supports_decision": ranking_supports_decision(_MODEL_STATE.get("metrics")),
+        "ranking_supports_decision": read_ranking_supports_decision(_MODEL_STATE.get("metrics")),
     }
 
 
@@ -227,7 +210,7 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
         driver_id=request.driver_id,
         uplift_score=uplift_score,
         recommended_treatment=treatment,
-        ranking_supports_decision=ranking_supports_decision(_MODEL_STATE.get("metrics")),
+        ranking_supports_decision=read_ranking_supports_decision(_MODEL_STATE.get("metrics")),
         model_name=_MODEL_STATE.get("model_name"),
     )
 
