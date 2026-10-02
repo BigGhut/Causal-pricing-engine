@@ -79,6 +79,24 @@ def score_uplift(features: dict[str, float]) -> float:
     return float(np.asarray(scores).ravel()[0])
 
 
+def ranking_supports_decision(metrics: dict[str, Any] | None) -> bool:
+    """True only when the holdout Qini interval lies entirely above zero.
+
+    A threshold on the score changes the fare only in that case. If the
+    interval covers zero, the score is not separated from a random ranking,
+    and cutting the surcharge at -0.05 follows noise.
+    """
+    if not metrics:
+        return False
+    low = metrics.get("qini_low")
+    if low is None:
+        return False
+    try:
+        return float(low) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def recommend_treatment(uplift_score: float, threshold: float | None = None) -> str:
     """Map the surcharge effect to one action.
 
@@ -87,7 +105,8 @@ def recommend_treatment(uplift_score: float, threshold: float | None = None) -> 
 
     ``SURCHARGE``: the surcharge raises acceptance.
     ``KEEP_QUOTE``: the score is inside the threshold, so the quote stands.
-    ``NO_SURCHARGE``: the surcharge lowers acceptance. DPE then charges the base fare.
+    ``NO_SURCHARGE``: the score says the surcharge lowers acceptance.
+    DPE charges the base fare only when ``ranking_supports_decision`` is true.
     """
     thr = threshold if threshold is not None else float(_MODEL_STATE.get("uplift_threshold", 0.05))
     if uplift_score > thr:
@@ -106,6 +125,7 @@ def apply_model_payload(payload: dict[str, Any]) -> None:
     _MODEL_STATE["uplift_threshold"] = float(
         payload.get("uplift_threshold", load_config().api.uplift_threshold)
     )
+    _MODEL_STATE["metrics"] = payload.get("metrics") or {}
 
 
 @asynccontextmanager
@@ -156,6 +176,7 @@ class PredictUpliftResponse(BaseModel):
     driver_id: str
     uplift_score: float
     recommended_treatment: str
+    ranking_supports_decision: bool
     model_name: str | None = None
 
 
@@ -169,6 +190,7 @@ def health_check() -> dict[str, Any]:
         "model_name": str(_MODEL_STATE.get("model_name") or ""),
         "source": str(_MODEL_STATE.get("source") or ""),
         "feature_columns": _MODEL_STATE.get("feature_columns", []),
+        "ranking_supports_decision": ranking_supports_decision(_MODEL_STATE.get("metrics")),
     }
 
 
@@ -205,6 +227,7 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
         driver_id=request.driver_id,
         uplift_score=uplift_score,
         recommended_treatment=treatment,
+        ranking_supports_decision=ranking_supports_decision(_MODEL_STATE.get("metrics")),
         model_name=_MODEL_STATE.get("model_name"),
     )
 

@@ -242,7 +242,10 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
         f"({qini['n_boot']} resamples of this one split)"
     )
     if qini["low"] < 0 < qini["high"]:
-        print("[*] That interval contains 0. The point estimate on this split is not separated from noise.")
+        print(
+            "[*] That interval contains 0. The point estimate on this split is not "
+            "separated from noise, so a score below -0.05 does not change the fare."
+        )
     print(
         f"[*] Random-score Qini: mean {qini_null['mean']:+.4f}  "
         f"95% [{qini_null['low']:+.4f}, {qini_null['high']:+.4f}] "

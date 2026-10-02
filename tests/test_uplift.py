@@ -241,30 +241,50 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     assert qini > qini_random - 0.05
 
 
-def test_qini_beats_random_on_holdout():
-    """Verify T-Learner Qini significantly beats random null on holdout (synthetic n=1500, 30% test)."""
+def test_ranking_gate_requires_the_qini_interval_above_zero():
+    from src.api.main import ranking_supports_decision
+
+    assert ranking_supports_decision({"qini_low": -0.003, "qini_high": 0.116}) is False
+    assert ranking_supports_decision({"qini_low": 0.2, "qini_high": 0.4}) is True
+    assert ranking_supports_decision({}) is False
+    assert ranking_supports_decision(None) is False
+
+
+def test_qini_beats_random_when_the_planted_effect_is_large():
+    """A large planted effect must beat random scores, with the interval off zero.
+
+    The portfolio generator plants +0.25 and -0.12. On that draw the Qini
+    interval covers 0, so a test that the portfolio model beats one random
+    ranking will flicker. This draw plants ±0.45. The margin is wide on purpose.
+    """
     from sklearn.model_selection import train_test_split
 
-    df = generate_uplift_dataset(n=1500, random_state=42)
-    X = df[FEATURE_COLUMNS].to_numpy()
-    y = df["accepted"].to_numpy()
-    t = df["treatment"].to_numpy()
+    from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval
+
+    rng = np.random.default_rng(11)
+    n = 4000
+    past_trips = rng.normal(size=n)
+    distance_km = rng.normal(size=n)
+    treatment = rng.binomial(1, 0.5, size=n)
+    planted = np.where(past_trips > 0.0, 0.45, -0.45)
+    accepted = rng.binomial(1, np.clip(0.40 + treatment * planted, 0.02, 0.98))
+    features = np.column_stack([past_trips, distance_km])
 
     X_tr, X_te, y_tr, y_te, t_tr, t_te = train_test_split(
-        X, y, t, test_size=0.3, random_state=42, stratify=t
+        features, accepted, treatment, test_size=0.3, random_state=11, stratify=treatment
     )
     model = TLearner(
-        base_estimator=GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=42)
+        base_estimator=GradientBoostingClassifier(
+            n_estimators=40, max_depth=2, random_state=11
+        )
     )
     model.fit(X_tr, y_tr, t_tr)
-    u_te = model.predict_uplift(X_te)
+    scored = model.predict_uplift(X_te)
+    interval = qini_bootstrap_interval(y_te, scored, t_te, n_boot=50, seed=11)
+    null = qini_random_interval(y_te, t_te, n_draws=50, seed=13)
 
-    qini_model = qini_auc_score(y_te, u_te, t_te)
-    rng = np.random.default_rng(42)
-    qini_random = qini_auc_score(y_te, rng.normal(size=len(y_te)), t_te)
-
-    assert qini_model > qini_random + 0.02 or (qini_model > 0 and abs(qini_random) < 0.15)
-    assert -1.5 <= qini_model <= 1.5
+    assert interval["low"] > 0.20
+    assert interval["low"] > null["high"] + 0.15
 
 
 def test_qini_normalized_oracle_and_null():

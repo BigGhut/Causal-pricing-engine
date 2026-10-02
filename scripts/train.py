@@ -22,7 +22,8 @@ from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearn
 from src.config import load_config
 from src.data.dpe_connector import describe_switchback, load_dpe_data
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
-from src.evaluation.metrics import qini_auc_score, uplift_at_k
+from src.api.main import ranking_supports_decision
+from src.evaluation.metrics import qini_auc_score, qini_bootstrap_interval, uplift_at_k
 
 
 def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, random_state: int):
@@ -152,6 +153,19 @@ def train_and_select(
     scores = {k: v["qini_auc"] for k, v in results.items()}
     best_name = max(scores, key=scores.get)  # type: ignore[arg-type]
     best_model = candidates[best_name]
+    if best_name == "dml":
+        best_uplift = best_model.effect(X_test)
+    else:
+        best_uplift = best_model.predict_uplift(X_test)
+    interval = qini_bootstrap_interval(y_test, best_uplift, t_test, n_boot=200, seed=rs)
+    results[best_name]["qini_low"] = float(interval["low"])
+    results[best_name]["qini_high"] = float(interval["high"])
+    results[best_name]["ranking_supports_decision"] = ranking_supports_decision(results[best_name])
+    if not results[best_name]["ranking_supports_decision"]:
+        print(
+            "Holdout Qini interval covers 0 or is missing. "
+            "A score below -0.05 does not change the fare."
+        )
 
     artifacts_dir = _ROOT / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)

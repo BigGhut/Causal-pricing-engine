@@ -40,7 +40,7 @@ from scripts.demo import (
     assert_scenario_honesty,
     pick_honest_scenarios,
 )
-from src.api.main import recommend_treatment
+from src.api.main import ranking_supports_decision, recommend_treatment
 from src.causal.uplift_models import TLearner
 from src.data.synthetic import (
     format_calibration,
@@ -148,17 +148,28 @@ def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, An
     return payload, scenarios, metrics
 
 
-def dpe_policy_from_uplift(uplift: float, threshold: float) -> dict[str, Any]:
+def dpe_policy_from_uplift(
+    uplift: float,
+    threshold: float,
+    *,
+    ranking_supports_decision: bool = False,
+) -> dict[str, Any]:
     """Mirror the DPE rule for this one treatment.
 
-    DPE asks CPE only when the switchback hour is additive and the search
-    names a driver. A score below -threshold drops that additive surcharge
-    and charges the base fare. A positive score does not invent a discount.
+    A score below -threshold drops the additive surcharge only when the
+    holdout Qini interval lies entirely above zero. Otherwise the cut follows
+    a ranking that is not separated from noise, and the surcharge stays.
     """
     treatment = recommend_treatment(uplift, threshold=threshold)
-    override = uplift < -threshold
+    score_says_drop = uplift < -threshold
+    override = score_says_drop and ranking_supports_decision
     if override:
         action = "charge the base fare and drop the additive surcharge"
+    elif score_says_drop:
+        action = (
+            "score is below the threshold, but the Qini interval covers 0, "
+            "so the surcharge stays"
+        )
     elif treatment == "SURCHARGE":
         action = "keep the additive surcharge"
     else:
@@ -166,6 +177,7 @@ def dpe_policy_from_uplift(uplift: float, threshold: float) -> dict[str, Any]:
     return {
         "causal_uplift_score": uplift,
         "causal_override": override,
+        "ranking_supports_decision": ranking_supports_decision,
         "causal_recommended_treatment": treatment,
         "test_group_if_dpe": "CAUSAL_NO_SURGE" if override else "ADDITIVE",
         "pricing_action": action,
@@ -229,7 +241,10 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
                 print(f"[FAIL] neutral unexpected treatment={treatment}")
                 return 1
 
-            policy = dpe_policy_from_uplift(score, threshold)
+            supports = ranking_supports_decision(metrics)
+            policy = dpe_policy_from_uplift(
+                score, threshold, ranking_supports_decision=supports
+            )
             print(
                 f"    [{sc.role}] τ̂={score:+.4f} → {treatment} | "
                 f"DPE override={policy['causal_override']}"
@@ -325,7 +340,8 @@ def _write_evidence(
         f"95% bootstrap `[{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]` "
         f"on {metrics['qini_boot']} resamples of this one split."
         + (
-            " The interval contains 0, so the point estimate on this split is not separated from noise."
+            " The interval contains 0, so the point estimate on this split is not separated from noise. "
+            "DPE does not drop the surcharge at -0.05 for this model: that cut would follow noise."
             if metrics["qini_low"] < 0 < metrics["qini_high"]
             else ""
         ),
@@ -383,20 +399,26 @@ def _write_evidence(
         lines.append("")
 
     sd = next(r for r in rows if r["role"] == "sleeping_dog")
-    assert sd["dpe_policy_simulation"]["causal_override"] is True
     planted = sd.get("planted_uplift")
     planted_text = "unknown" if planted is None else f"{float(planted):+.2f}"
+    override = sd["dpe_policy_simulation"]["causal_override"]
+    score = sd["http_response"]["uplift_score"]
+    label = sd["http_response"]["recommended_treatment"]
+    if override:
+        decision = "DPE would charge the base fare, because the Qini interval is above 0."
+    else:
+        decision = (
+            "DPE keeps the surcharge. The score is past -0.05, but the Qini interval "
+            "covers 0, so the threshold would be cutting on noise."
+        )
     lines.extend(
         [
             "## What the lowest score does",
             "",
-            f"Captured uplift `{sd['http_response']['uplift_score']:+.4f}` "
-            f"→ `{sd['http_response']['recommended_treatment']}` "
-            "→ DPE would charge the base fare.",
+            f"Captured uplift `{score:+.4f}` → `{label}`. {decision}",
             f"The planted effect on that same row is `{planted_text}`. "
             "The row was chosen because its score is the minimum, not because it "
-            "belongs to the sleeping-dog cut. If the planted effect is near zero, "
-            "the override fires where the surcharge was not harmful.",
+            "belongs to the sleeping-dog cut.",
             "The segment means above are the calibration check. This row is not.",
             "",
         ]

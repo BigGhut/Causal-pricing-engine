@@ -10,10 +10,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: causal-pricing-engine
+      - uses: actions/checkout@v4
+        with:
+          repository: BigGhut/Dynamic-pricing-engine
+          ref: 82be4a4ac9329477f989e1497bd099abdf432800
+          path: dynamic-pricing-engine
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install
+        working-directory: causal-pricing-engine
         run: pip install -e ".[dev]"
       - name: Test
+        working-directory: causal-pricing-engine
         run: pytest tests -q --tb=short
