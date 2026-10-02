@@ -21,12 +21,14 @@ from src.config import load_config
 from src.data.dpe_connector import describe_switchback, load_dpe_data
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
 from src.evaluation.metrics import (
+    false_override_rate,
     holdout_decision,
     qini_auc_score,
     qini_bootstrap_interval,
     split_train_calibration_test,
     uplift_at_k,
 )
+from src.evaluation.protocol import FALSE_OVERRIDE_RATE_MAX, SCORE_THRESHOLD
 
 
 def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, random_state: int):
@@ -181,7 +183,18 @@ def train_and_select(
     results[best_name]["qini_low"] = float(test_interval["low"])
     results[best_name]["qini_high"] = float(test_interval["high"])
     results[best_name]["test_qini_auc"] = float(test_interval["point"])
-    results[best_name].update(holdout_decision(float(cal_interval["low"])))
+    cal_rate = false_override_rate(
+        best_cal,
+        df["true_uplift"].to_numpy()[cal_idx],
+        threshold=SCORE_THRESHOLD,
+    )
+    results[best_name].update(
+        holdout_decision(
+            float(cal_interval["low"]),
+            false_override_rate=cal_rate,
+            false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
+        )
+    )
     print(
         f"Calibration Qini 95% [{cal_interval['low']:+.4f}, {cal_interval['high']:+.4f}] "
         f"sets ranking_supports_decision="

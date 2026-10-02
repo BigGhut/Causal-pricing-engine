@@ -21,25 +21,18 @@ def _qini_cumulative(
         Q(k) = sum(y|T=1) - sum(y|T=0) * (n_t / n_c)
     i.e. incremental treated outcomes vs scaled control outcomes.
     """
-    y_s = y[order]
-    t_s = treatment[order]
+    y_s = np.asarray(y[order], dtype=float)
+    treated = np.asarray(treatment[order]) == 1
     n = len(y_s)
     qini = np.zeros(n + 1, dtype=float)
-    n_t = 0.0
-    n_c = 0.0
-    sum_y_t = 0.0
-    sum_y_c = 0.0
-    for i in range(n):
-        if t_s[i] == 1:
-            n_t += 1
-            sum_y_t += y_s[i]
-        else:
-            n_c += 1
-            sum_y_c += y_s[i]
-        if n_c > 0:
-            qini[i + 1] = sum_y_t - sum_y_c * (n_t / n_c)
-        else:
-            qini[i + 1] = sum_y_t
+    if n == 0:
+        return qini
+    sum_y_t = np.cumsum(np.where(treated, y_s, 0.0))
+    sum_y_c = np.cumsum(np.where(treated, 0.0, y_s))
+    n_t = np.cumsum(treated)
+    n_c = np.cumsum(~treated)
+    body = np.where(n_c > 0, sum_y_t - sum_y_c * (n_t / np.maximum(n_c, 1)), sum_y_t)
+    qini[1:] = body
     return qini
 
 
@@ -243,17 +236,19 @@ def holdout_decision(
     """Decide, at training time, whether scores may change a fare.
 
     Pass the Qini lower bound from the calibration slice, not from the untouched test.
-    The flag is true only when that bound is above zero.
-    A false-override rate is stored when it is passed, but it does not affect
-    the flag until a maximum is passed too. That maximum is not set yet.
+    The flag is true only when that bound is above zero and, once a maximum is
+    set, the false-override rate is defined and not greater than the maximum.
+    A rate equal to the maximum passes. An undefined rate fails.
     """
     qini_ok = float(qini_low) > 0.0
-    rate_applied = false_override_rate is not None and false_override_rate_max is not None
-    if not rate_applied:
+    if false_override_rate_max is None:
         rate_ok = True
         rate_check = "not_applied"
+    elif false_override_rate is None:
+        rate_ok = False
+        rate_check = "undefined"
     else:
-        rate_ok = float(false_override_rate) < float(false_override_rate_max)
+        rate_ok = float(false_override_rate) <= float(false_override_rate_max)
         rate_check = "pass" if rate_ok else "fail"
     return {
         "ranking_supports_decision": bool(qini_ok and rate_ok),
@@ -263,6 +258,75 @@ def holdout_decision(
         ),
         "false_override_check": rate_check,
     }
+
+
+def false_override_rate(
+    scores: np.ndarray | pd.Series,
+    true_uplift: np.ndarray | pd.Series,
+    *,
+    threshold: float = 0.05,
+) -> float | None:
+    """Share of fired overrides that hit a row whose true effect is not negative.
+
+    An override fires when ``score < -threshold``. It is false when
+    ``true_uplift >= 0``. The rate divides by the number of fired overrides.
+    No fired override makes the rate undefined.
+    """
+    score_arr, true_arr = _as_1d(scores, true_uplift)
+    fired = score_arr < -float(threshold)
+    n_fired = int(fired.sum())
+    if n_fired == 0:
+        return None
+    false = fired & (true_arr >= 0.0)
+    return float(false.sum() / n_fired)
+
+
+def pehe(
+    predicted: np.ndarray | pd.Series,
+    true_uplift: np.ndarray | pd.Series,
+) -> float:
+    """Root mean squared error of the score against the row-level true effect."""
+    pred_arr, true_arr = _as_1d(predicted, true_uplift)
+    return float(np.sqrt(np.mean((pred_arr - true_arr) ** 2)))
+
+
+def decile_calibration(
+    y: np.ndarray | pd.Series,
+    treatment: np.ndarray | pd.Series,
+    predicted: np.ndarray | pd.Series,
+    *,
+    n_bins: int = 10,
+) -> list[dict[str, float | int | None]]:
+    """Equal-count bins of predicted effect, low scores in decile 1.
+
+    ``observed_difference`` is mean outcome in the treated rows of the bin
+    minus mean outcome in the control rows. It is None when a bin lacks an arm.
+    """
+    y_arr, t_arr, p_arr = _as_1d(y, treatment, predicted)
+    n = len(p_arr)
+    if n == 0 or n_bins <= 0:
+        return []
+    order = np.argsort(p_arr, kind="mergesort")
+    rows: list[dict[str, float | int | None]] = []
+    for i, idx in enumerate(np.array_split(order, n_bins)):
+        if len(idx) == 0:
+            continue
+        treated = t_arr[idx] == 1
+        control = ~treated
+        observed: float | None
+        if treated.any() and control.any():
+            observed = float(y_arr[idx][treated].mean() - y_arr[idx][control].mean())
+        else:
+            observed = None
+        rows.append(
+            {
+                "decile": i + 1,
+                "n": int(len(idx)),
+                "mean_predicted": float(p_arr[idx].mean()),
+                "observed_difference": observed,
+            }
+        )
+    return rows
 
 
 def read_ranking_supports_decision(metrics: dict | None) -> bool:

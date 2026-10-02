@@ -241,6 +241,29 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     assert qini > qini_random - 0.05
 
 
+def test_artifact_records_flag_threshold_and_false_override_rate(tmp_path: Path):
+    import joblib
+
+    from src.evaluation.metrics import false_override_rate, holdout_decision
+    from src.evaluation.protocol import FALSE_OVERRIDE_RATE_MAX
+
+    scores = np.array([-0.2, -0.08, 0.1])
+    truth = np.array([0.25, -0.12, 0.0])
+    rate = false_override_rate(scores, truth, threshold=0.05)
+    decision = holdout_decision(
+        0.3,
+        false_override_rate=rate,
+        false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
+    )
+    path = tmp_path / "model.joblib"
+    joblib.dump({"metrics": decision}, path)
+    metrics = joblib.load(path)["metrics"]
+    assert "ranking_supports_decision" in metrics
+    assert metrics["false_override_rate_max"] == pytest.approx(0.10)
+    assert metrics["false_override_rate"] == pytest.approx(0.5)
+    assert metrics["ranking_supports_decision"] is False
+
+
 def test_holdout_splits_into_disjoint_calibration_and_test():
     from src.evaluation.metrics import split_train_calibration_test
 
@@ -274,10 +297,15 @@ def test_ranking_flag_is_fixed_at_training_and_only_read_at_serve():
 
     blocked = holdout_decision(0.2, false_override_rate=0.4, false_override_rate_max=0.1)
     allowed = holdout_decision(0.2, false_override_rate=0.05, false_override_rate_max=0.1)
+    at_cap = holdout_decision(0.2, false_override_rate=0.10, false_override_rate_max=0.10)
+    missing = holdout_decision(0.2, false_override_rate=None, false_override_rate_max=0.10)
     assert blocked["ranking_supports_decision"] is False
     assert blocked["false_override_check"] == "fail"
     assert allowed["ranking_supports_decision"] is True
     assert allowed["false_override_check"] == "pass"
+    assert at_cap["ranking_supports_decision"] is True
+    assert missing["ranking_supports_decision"] is False
+    assert missing["false_override_check"] == "undefined"
 
     # Serve does not turn qini_low back into a flag.
     assert read_ranking_supports_decision({"qini_low": 0.3}) is False

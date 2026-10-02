@@ -36,7 +36,9 @@ from src.data.synthetic import (
     generate_uplift_dataset,
     summarize_calibration,
 )
+from src.evaluation.protocol import FALSE_OVERRIDE_RATE_MAX
 from src.evaluation.metrics import (
+    false_override_rate,
     holdout_decision,
     qini_bootstrap_interval,
     qini_random_interval,
@@ -236,7 +238,15 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
     cal_uplift = model.predict_uplift(X_cal)
     test_uplift = model.predict_uplift(X_test)
     cal_qini = qini_bootstrap_interval(y_cal, cal_uplift, t_cal, n_boot=200, seed=0)
-    decision = holdout_decision(float(cal_qini["low"]))
+    decision = holdout_decision(
+        float(cal_qini["low"]),
+        false_override_rate=false_override_rate(
+            cal_uplift,
+            df["true_uplift"].to_numpy()[idx_cal],
+            threshold=threshold,
+        ),
+        false_override_rate_max=FALSE_OVERRIDE_RATE_MAX,
+    )
     qini = qini_bootstrap_interval(y_test, test_uplift, t_test, n_boot=200, seed=1)
     qini_null = qini_random_interval(y_test, t_test, n_draws=200, seed=2)
     u_at_30 = uplift_at_k(y_test, test_uplift, t_test, k=0.3)
