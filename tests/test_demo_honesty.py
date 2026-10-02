@@ -34,10 +34,10 @@ def test_pick_honest_scenarios_labels_match_scores():
     # Treatment mapping agreement
     from src.api.main import recommend_treatment
 
-    t_pos, _ = recommend_treatment(by_role["persuadable"].uplift, 0.05)
-    t_neg, _ = recommend_treatment(by_role["sleeping_dog"].uplift, 0.05)
-    assert t_pos == "DISCOUNT_10_PCT"
-    assert t_neg == "NO_DISCOUNT_AVOID"
+    t_pos = recommend_treatment(by_role["persuadable"].uplift, 0.05)
+    t_neg = recommend_treatment(by_role["sleeping_dog"].uplift, 0.05)
+    assert t_pos == "SURCHARGE"
+    assert t_neg == "NO_SURCHARGE"
 
 
 def test_pick_honest_scenarios_fails_without_negative_hte():

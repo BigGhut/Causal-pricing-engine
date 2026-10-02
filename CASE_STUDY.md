@@ -1,81 +1,37 @@
-# Case Study: Causal override for dynamic surge
+# Case Study: одна надбавка, один исход
 
-## Problem
+## Вопрос
 
-Marketplace pricing systems (taxi / delivery) often apply **surge** or discounts with rule-based or predictive models that estimate *level* of acceptance or conversion:
+DPE уже сравнивает две формулы surge, аддитивную и мультипликативную, переключая их по чётности виртуального часа. Отдельный вопрос sidecar: **снижает ли аддитивная надбавка шанс, что этот водитель возьмёт заказ**, настолько, что лучше оставить базовый тариф.
+
+Раньше под словом treatment в этом репозитории жили три разных вещи: скидка 5% в выручке при ярлыке `DISCOUNT_10_PCT`, рука switchback и снятие надбавки в DPE. Теперь везде одно:
 
 \[
-P(Y=1 \mid X, T)
+\tau(x)=P(\text{водитель принял}\mid \text{надбавка}, x)-P(\text{водитель принял}\mid \text{базовый тариф}, x)
 \]
 
-That confuses three groups:
+## Что оценивается, и на каких данных
 
-| Group | Behavior | If you always treat |
-|:---|:---|:---|
-| **Persuadables** | Convert *because* of treatment | Correct spend |
-| **Sure things / lost causes** | Same outcome with or without treatment | Wasted incentive / noise |
-| **Sleeping dogs** | Treatment *hurts* acceptance | Active damage (churn, reject) |
+Модель учится только на синтетике, где надбавка назначается монетой на каждый заказ, независимо от признаков. Единица — заказ водителю (`driver_id`). Исход — `accepted`.
 
-In a companion **Dynamic Pricing Engine (DPE)** simulation, additive vs multiplicative surge is A/B-tested. The open question for portfolio work: **who should not receive aggressive surge at all?**
+Признаки, известные до надбавки: `distance_km`, `duration_sec`, `hour_of_day`, `past_trips`, `avg_surge`. Цена и `surge_bonus` от руки зависят, в матрицу не входят. `hour_of_day` в синтетике — ковариата, не механизм назначения.
 
-## Approach
+Заложенные сегменты — пороги по `past_trips` и `distance_km`. Обе колонки модель получает. Восстановить знак на таком генераторе несложно, и это проверка пайплайна, а не найденный сегмент. Средний \(\hat\tau\) по сегменту сравнивается с заложенным значением (+0.25 / 0 / −0.12). Строка «persuadable» в демо — это максимальный score на holdout, а не типичный заказ сегмента. Если она в разы выше +0.25, это завышение, и так и написано в `docs/evidence/latest_proof.md`.
 
-I built **Causal Pricing Engine (CPE)** as a small service next to DPE:
+Qini считается на одном разбиении. Рядом бутстреп-интервал этого коэффициента и интервал Qini при случайных скорах. Одно случайное число вроде 0.009 нулём не является.
 
-1. **Target** — Individual Treatment Effect (uplift):
-   \[
-   \tau(x)=\mathbb{E}[Y^{(1)}-Y^{(0)}\mid X=x]
-   \]
-2. **Model** — T-Learner (two outcome models) on sklearn GBM; optional S/X/DML remain in the codebase but are not required for the demo path.
-3. **Data** — synthetic data with seeded heterogeneous TE for a reproducible story, plus a connector to DPE `simulation_analytics` SQLite for the same feature schema.
-4. **Serve** — FastAPI `POST /predict_uplift` on `:8100`.
-5. **Integrate** — DPE calls CPE with timeout ≤200 ms, **fail-open** if CPE is down; if \(\hat\tau(x) < -\theta\) (default \(\theta=0.05\)), DPE sets surge to base fare (`CAUSAL_NO_SURGE`) and exposes `causal_*` fields on the price response.
-6. **Parity** — `past_trips` / `avg_surge` are defined *as-of prior trip* offline (`load_dpe_data`) and online (`DriverHistoryStore`).
+## Лог DPE
 
-## What “good” means here
+`simulation_analytics` хранит руку `ADDITIVE` / `MULTIPLICATIVE`, принятие водителем и `driver_id`. Рука постоянна внутри виртуального часа, поэтому T-learner по строкам оценил бы разницу часов, а не эффект для водителя. `timestamp` — часы процесса. Из него час не выводится. Колонка `virtual_hour` появляется в новых прогонах симулятора; в старом файле её нет, и подставлять вместо неё стенные часы нельзя.
 
-| Signal | Role |
-|:---|:---|
-| **Qini coefficient / Uplift@k** | Offline ranking quality of \(\hat\tau\) (Qini is **normalized** ≈[-1,1], not raw area) |
-| **Honest demo** | Labels *persuadable / neutral / sleeping dog* come from real scored rows, not hand-waved features |
-| **Portfolio proof** | Live HTTP scores + the same override rule DPE uses, captured in `docs/evidence/latest_proof.md` |
+`python scripts/train.py --source dpe` и `evaluate_experiment.py --source dpe` этот дизайн печатают и индивидуальную модель не учат.
 
-This is **not** a claim of production lift on a city-scale A/B. Simulation n is small; experiment power for raw conversion deltas is limited (see archived CUPED eval). The portfolio claim is narrower and honest:
+## Как это приезжает в цену
 
-> Given HTE in the data, we can score ITE, map it to a pricing policy, and wire that policy into a pricing service without taking the pricing path down when the model is unavailable.
+DPE вызывает CPE, только если час аддитивный и в поиске назван водитель. Score ниже −0.05 заменяет надбавку базовым тарифом (`CAUSAL_NO_SURGE`). Таймаут не роняет котировку. Мультипликативный час CPE не трогает: это другой контраст, его DPE уже читает своим switchback.
 
-> **Methodological & Pipeline Disclaimers:**
-> - **Synthetic DGP**: Uses a synthetic dataset with **seeded Heterogeneous Treatment Effects (HTE)** where true \(\tau(x)\) is a piecewise function of `past_trips` and `surge_bonus`. The demo proves **end-to-end pipeline execution and policy integration**, not actual city-scale production lift.
-> - **Normalized Qini**: Evaluated metrics report the **normalized Qini coefficient** (scale \([-1, 1]\), where random ranking \(\approx 0\) and oracle \(\approx 1\)), avoiding legacy unnormalized \(O(n^2)\) area misinterpretations.
-> - **DPE Observational Data**: Training models on DPE switchback simulation logs uses observational data where post-treatment features (such as `price` and `surge_bonus`) may be treatment-entangled. Pre-treatment feature sets are provided for causal purity during offline training (see Stage C / `CAUSAL.md`).
+В самом симуляторе трафика водитель выбирается после цены, поэтому этот прогон `driver_id` в поиск не кладёт и CPE не спрашивает. Клиент, который водителя уже знает, передаёт его в `SearchRequest`.
 
-## Trade-offs I accepted
+## Чего здесь нет
 
-| Choice | Why |
-|:---|:---|
-| Fail-open | Wrong surge is better than no price / timeout cascade |
-| Hard threshold on \(\hat\tau\) | Interpretable Sleeping Dog rule; easy to audit |
-| Separate CPE process | Shows integration (timeout, schema, ops) not only a notebook |
-| Synthetic default for demo | Guarantees +/− HTE so labels stay true; DPE path via `--source dpe` |
-
-## How to reproduce (5 minutes)
-
-```powershell
-cd causal-pricing-engine
-pip install -r requirements.txt
-pip install -e .
-python scripts/demo.py              # honest three roles
-python scripts/portfolio_proof.py   # HTTP + evidence markdown
-```
-
-Optional dual stack: CPE `:8100`, DPE `:8000`, then `python scripts/portfolio_proof.py --with-dpe`.
-
-## What I would do next (if this were a product)
-
-1. Larger switchback logs and CUPED-powered readouts of the override policy.  
-2. Multi-treatment (surge levels / discount depths), not binary treat/control.  
-3. Shared feature store so online graph features match offline training columns under load.
-
-## One-line summary
-
-**Uplift scoring as a fail-open sidecar that stops surge for predicted Sleeping Dogs — demonstrated with honest holdout picks and captured HTTP evidence, integrated with a graph-based dynamic pricing simulator.**
+Это не городской A/B и не оценка switchback DPE. Цифры switchback живут в том репозитории и сюда не переносятся.

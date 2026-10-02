@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "causal-pricing-engine"
 version = "0.1.0"
 description = "Causal ML & Uplift Modeling Engine for Dynamic Pricing and Experimentation"
-authors = [{ name = "Author" }]
+authors = [{ name = "Bigghut", email = "astafev033@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.10"
 

@@ -20,5 +20,5 @@ data:
   random_state: 42
 
 dpe:
-  db_path: "Z:/pet-project/dynamic-pricing-engine/dpe_database.db"
+  db_path: ""
 

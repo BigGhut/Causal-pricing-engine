@@ -7,7 +7,7 @@ services:
       - PYTHONUNBUFFERED=1
       - CPE_API__PORT=8100
       - CPE_DPE__DB_PATH=/app/data/dpe_database.db
-      - CPE_RETRAIN_ON_START=1
+      - CPE_RETRAIN_ON_START=0
     volumes:
       - ../dynamic-pricing-engine/dpe_database.db:/app/data/dpe_database.db:ro
     restart: unless-stopped

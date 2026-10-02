@@ -102,12 +102,10 @@ def check_cpe_health(cpe_url: str) -> dict[str, Any]:
 def check_cpe_predict(cpe_url: str) -> dict[str, Any]:
     print(f"[Smoke] 2. Testing CPE /predict_uplift ...")
     payload = {
-        "user_id": "smoke_user_1",
+        "driver_id": "smoke_driver_1",
         "features": {
             "distance_km": 6.5,
             "duration_sec": 750.0,
-            "price": 25.0,
-            "surge_bonus": 2.0,
             "hour_of_day": 15.0,
             "past_trips": 4.0,
             "avg_surge": 1.25,
@@ -123,7 +121,7 @@ def check_cpe_predict(cpe_url: str) -> dict[str, Any]:
 
     print(
         f"  [OK] CPE predict_uplift score={data['uplift_score']:.4f}, "
-        f"treatment='{data['recommended_treatment']}', discount={data.get('optimal_discount_pct')}%"
+        f"treatment='{data['recommended_treatment']}'"
     )
     return data
 

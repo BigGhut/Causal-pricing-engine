@@ -1,49 +1,52 @@
 # Causal Pricing Engine (CPE)
 
-**Uplift-sidecar** для [Dynamic Pricing Engine (DPE)](https://github.com/BigGhut/Dynamic-pricing-engine): считает индивидуальный эффект воздействия (ITE) и подсказывает, **кому не давать агрессивный surge** (Sleeping Dogs).
+Sidecar для [Dynamic Pricing Engine](https://github.com/BigGhut/Dynamic-pricing-engine). Оценивает **один** эффект: как **аддитивная надбавка** меняет вероятность того, что **водитель примет** заказ, относительно **базового тарифа**.
 
-Python ≥ 3.10 · scikit-learn · FastAPI · Docker  
-Порт CPE `:8100` · DPE `:8000` · вызов `POST /predict_uplift` · timeout ≤ 200 ms · **fail-open**
+Если оценка ниже −0.05, DPE снимает эту надбавку и оставляет базовый тариф (`CAUSAL_NO_SURGE`). Вызов fail-open, таймаут 200 мс. DPE спрашивает CPE только в аддитивный виртуальный час и только если в поиске есть `driver_id`.
 
-| | DPE | CPE |
-|:---|:---|:---|
-| Роль | цена, граф, surge | ITE / policy hint |
-| Док интеграции | [CAUSAL.md](https://github.com/BigGhut/Dynamic-pricing-engine/blob/main/CAUSAL.md) | этот репо |
+Это не скидка и не switchback «аддитивная формула против мультипликативной». Та рука назначается чётностью виртуального часа, так что водителю воздействие не рандомизировано. Модель на этих логах не учится.
 
-**Честно:** дефолтное демо — синтетика с заложенным HTE, не city-scale prod lift. Qini — нормализованный. Подробности и trade-off → [CASE_STUDY.md](CASE_STUDY.md).
+Обучение — синтетические заказы, где надбавка случайна на уровне заказа. Сегменты в генераторе — пороги по `past_trips` и `distance_km`, и эти колонки модель видит. Попасть в знак эффекта здесь не открытие. Qini на одном разбиении приведён с бутстреп-интервалом, случайный Qini — распределением, а не одним числом. Цифры: [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md).
+
+Python ≥ 3.10 · scikit-learn · FastAPI  
+CPE `:8100` · DPE `:8000`
+
+Признаки: `distance_km`, `duration_sec`, `hour_of_day`, `past_trips`, `avg_surge`. `price` и `surge_bonus` в модель не входят.
 
 ```text
-DPE :8000  --POST /predict_uplift (≤200ms, fail-open)-->  CPE :8100
-                τ̂ < -0.05  →  base fare, CAUSAL_NO_SURGE
+DPE :8000  --POST /predict_uplift (аддитивный час, есть driver_id)-->  CPE :8100
+                τ̂ < -0.05  →  базовый тариф, CAUSAL_NO_SURGE
 ```
 
 ## Запуск
 
 ```powershell
-pip install -r requirements.txt && pip install -e .
-python scripts/demo.py              # честные роли с holdout
-python scripts/portfolio_proof.py   # HTTP + docs/evidence/
-# make demo | make proof | make train | make test | make serve
+pip install -r requirements.txt
+pip install -e .
+python scripts/train.py --source synthetic
+python scripts/demo.py
+python scripts/portfolio_proof.py
 ```
 
-Опционально: `pip install -e ".[causal]"` (EconML и др.) · dual-stack с DPE: CPE `:8100` + DPE `:8000`, затем `python scripts/portfolio_proof.py --with-dpe`.
+`python scripts/train.py --source dpe` модель не пишет: печатает, почему лог switchback не является этим экспериментом. Путь к базе — соседний checkout `dynamic-pricing-engine/dpe_database.db` или `CPE_DPE__DB_PATH`.
 
 ## API
 
-`GET /health` · `POST /predict_uplift`  
-Тело: `{ "user_id", "features": { distance_km, duration_sec, price, surge_bonus, hour_of_day, past_trips, avg_surge } }`  
-Ответ: `uplift_score`, `recommended_treatment` (`DISCOUNT_10_PCT` / `NO_DISCOUNT` / `NO_DISCOUNT_AVOID`), `model_name`.  
-Перед serve: `python scripts/train.py`.
+`GET /health` · `POST /predict_uplift`
 
-## Evidence (пример)
+```json
+{
+  "driver_id": "driver_008",
+  "features": {
+    "distance_km": 7.0,
+    "duration_sec": 900.0,
+    "hour_of_day": 11.0,
+    "past_trips": 4.0,
+    "avg_surge": 12.0
+  }
+}
+```
 
-Captured `scripts/portfolio_proof.py` (2026-08-09): Qini **+0.084**, Uplift@30% **+0.23**, Sleeping Dog \(\hat\tau\approx-0.42\) → override.  
-Полный JSON → [docs/evidence/latest_proof.md](docs/evidence/latest_proof.md).
+Ответ: `uplift_score`, `recommended_treatment` (`SURCHARGE` / `KEEP_QUOTE` / `NO_SURCHARGE`), `model_name`.
 
-## Структура
-
-`src/api` · `src/causal` · `src/data` · `src/evaluation` · `scripts/` (demo, proof, train) · `docs/evidence` · `docs/archive` · `tests/`
-
-## Дальше
-
-[CASE_STUDY.md](CASE_STUDY.md) · [evidence](docs/evidence/latest_proof.md) · [DPE](https://github.com/BigGhut/Dynamic-pricing-engine) · [CAUSAL.md](https://github.com/BigGhut/Dynamic-pricing-engine/blob/main/CAUSAL.md) · [archive](docs/archive/README.md)
+Интеграция на стороне DPE: [CAUSAL.md](https://github.com/BigGhut/Dynamic-pricing-engine/blob/main/CAUSAL.md). Разбор ограничений: [CASE_STUDY.md](CASE_STUDY.md).

@@ -42,8 +42,12 @@ from scripts.demo import (
 )
 from src.api.main import recommend_treatment
 from src.causal.uplift_models import TLearner
-from src.data.synthetic import generate_uplift_dataset
-from src.evaluation.metrics import qini_auc_score, uplift_at_k
+from src.data.synthetic import (
+    format_calibration,
+    generate_uplift_dataset,
+    summarize_calibration,
+)
+from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval, uplift_at_k
 
 EVIDENCE_PATH = _ROOT / "docs" / "evidence" / "latest_proof.md"
 
@@ -83,14 +87,18 @@ def _start_cpe() -> subprocess.Popen:
     return proc
 
 
-def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, float]]:
+def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, Any]]:
     df = generate_uplift_dataset(n=3000, random_state=42)
-    X = df[FEATURE_COLS].to_numpy(dtype=float)
-    y = df["conversion"].to_numpy(dtype=int)
-    t = df["treatment"].to_numpy(dtype=int)
-    X_tr, X_va, y_tr, y_va, t_tr, t_va = train_test_split(
-        X, y, t, test_size=0.3, random_state=42, stratify=t
+    idx = np.arange(len(df))
+    idx_tr, idx_va = train_test_split(
+        idx, test_size=0.3, random_state=42, stratify=df["treatment"].to_numpy()
     )
+    X = df[FEATURE_COLS].to_numpy(dtype=float)
+    y = df["accepted"].to_numpy(dtype=int)
+    t = df["treatment"].to_numpy(dtype=int)
+    X_tr, X_va = X[idx_tr], X[idx_va]
+    y_tr, y_va = y[idx_tr], y[idx_va]
+    t_tr, t_va = t[idx_tr], t[idx_va]
     model = TLearner(
         base_estimator=GradientBoostingClassifier(
             n_estimators=50, max_depth=3, random_state=42
@@ -98,14 +106,32 @@ def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, fl
     )
     model.fit(X_tr, y_tr, t_tr)
     u_va = model.predict_uplift(X_va)
-    rng = np.random.default_rng(0)
-    q_null = float(qini_auc_score(y_va, rng.normal(size=len(y_va)), t_va))
+    qini = qini_bootstrap_interval(y_va, u_va, t_va, n_boot=200, seed=0)
+    qini_null = qini_random_interval(y_va, t_va, n_draws=200, seed=1)
+    calibration = summarize_calibration(
+        df["segment"].to_numpy()[idx_va],
+        df["true_uplift"].to_numpy()[idx_va],
+        u_va,
+    )
     metrics = {
-        "qini_auc": float(qini_auc_score(y_va, u_va, t_va)),
-        "qini_null": q_null,
+        "qini_auc": float(qini["point"]),
+        "qini_low": float(qini["low"]),
+        "qini_high": float(qini["high"]),
+        "qini_boot": int(qini["n_boot"]),
+        "qini_random_mean": float(qini_null["mean"]),
+        "qini_random_low": float(qini_null["low"]),
+        "qini_random_high": float(qini_null["high"]),
+        "qini_random_draws": int(qini_null["n_draws"]),
         "uplift_at_k": float(uplift_at_k(y_va, u_va, t_va, k=0.3)),
+        "calibration": calibration,
     }
-    scenarios = pick_honest_scenarios(X_va, u_va, FEATURE_COLS, threshold=threshold)
+    scenarios = pick_honest_scenarios(
+        X_va,
+        u_va,
+        FEATURE_COLS,
+        threshold=threshold,
+        true_uplift=df["true_uplift"].to_numpy()[idx_va],
+    )
     assert_scenario_honesty(scenarios, threshold=threshold)
 
     artifacts = _ROOT / "artifacts"
@@ -123,24 +149,26 @@ def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, fl
 
 
 def dpe_policy_from_uplift(uplift: float, threshold: float) -> dict[str, Any]:
-    """Mirror DPE Sleeping Dog rule (src/api/main.py causal block)."""
-    treatment, discount = recommend_treatment(uplift, threshold=threshold)
+    """Mirror the DPE rule for this one treatment.
+
+    DPE asks CPE only when the switchback hour is additive and the search
+    names a driver. A score below -threshold drops that additive surcharge
+    and charges the base fare. A positive score does not invent a discount.
+    """
+    treatment = recommend_treatment(uplift, threshold=threshold)
     override = uplift < -threshold
+    if override:
+        action = "charge the base fare and drop the additive surcharge"
+    elif treatment == "SURCHARGE":
+        action = "keep the additive surcharge"
+    else:
+        action = "keep the quoted surcharge; the score is inside the threshold"
     return {
         "causal_uplift_score": uplift,
         "causal_override": override,
         "causal_recommended_treatment": treatment,
-        "optimal_discount_pct": discount,
-        "test_group_if_dpe": "CAUSAL_NO_SURGE" if override else "(unchanged switchback arm)",
-        "pricing_action": (
-            "force base fare / zero surge_bonus"
-            if override
-            else (
-                "allow treatment / discount path"
-                if treatment == "DISCOUNT_10_PCT"
-                else "keep rule-based surge"
-            )
-        ),
+        "test_group_if_dpe": "CAUSAL_NO_SURGE" if override else "ADDITIVE",
+        "pricing_action": action,
     }
 
 
@@ -152,9 +180,11 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
     print("[1] Train + honest scenario pick (synthetic HTE)...")
     payload, scenarios, metrics = train_and_pick(threshold)
     print(
-        f"    Qini coef={metrics['qini_auc']:+.4f} (random null {metrics['qini_null']:+.4f})  "
+        f"    Qini {metrics['qini_auc']:+.4f} "
+        f"95% [{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]  "
         f"Uplift@30%={metrics['uplift_at_k']:+.4f}"
     )
+    print(format_calibration(metrics["calibration"]))
 
     cpe_url = "http://127.0.0.1:8100"
     managed: subprocess.Popen | None = None
@@ -173,7 +203,7 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
 
         print("[3] POST /predict_uplift for each honest role...")
         for sc in scenarios:
-            body = {"user_id": f"proof_{sc.role}", "features": sc.features}
+            body = {"driver_id": f"proof_{sc.role}", "features": sc.features}
             resp = httpx.post(f"{cpe_url}/predict_uplift", json=body, timeout=5.0)
             if resp.status_code != 200:
                 print(f"[FAIL] {sc.role}: HTTP {resp.status_code} {resp.text}")
@@ -181,18 +211,21 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
             data = resp.json()
             score = float(data["uplift_score"])
             treatment = data["recommended_treatment"]
-            expected, _ = recommend_treatment(sc.uplift, threshold=threshold)
+            expected = recommend_treatment(sc.uplift, threshold=threshold)
+            if treatment != expected:
+                print(f"[FAIL] {sc.role}: HTTP {treatment} != offline {expected}")
+                return 1
 
             # HTTP score should agree in sign band with offline pick
-            if sc.role == "persuadable" and not (score > threshold and treatment == "DISCOUNT_10_PCT"):
+            if sc.role == "persuadable" and not (score > threshold and treatment == "SURCHARGE"):
                 print(f"[FAIL] persuadable HTTP score={score} treatment={treatment}")
                 return 1
             if sc.role == "sleeping_dog" and not (
-                score < -threshold and treatment == "NO_DISCOUNT_AVOID"
+                score < -threshold and treatment == "NO_SURCHARGE"
             ):
                 print(f"[FAIL] sleeping_dog HTTP score={score} treatment={treatment}")
                 return 1
-            if sc.role == "neutral" and treatment not in {"NO_DISCOUNT", "DISCOUNT_10_PCT", "NO_DISCOUNT_AVOID"}:
+            if sc.role == "neutral" and treatment not in {"KEEP_QUOTE", "SURCHARGE", "NO_SURCHARGE"}:
                 print(f"[FAIL] neutral unexpected treatment={treatment}")
                 return 1
 
@@ -207,6 +240,7 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
                     "label": sc.label,
                     "features": sc.features,
                     "offline_uplift": sc.uplift,
+                    "planted_uplift": sc.true_uplift,
                     "http_response": data,
                     "dpe_policy_simulation": policy,
                 }
@@ -284,20 +318,56 @@ def _write_evidence(
         "## Setup",
         "",
         f"- Threshold: `±{threshold}`",
-        f"- Holdout Qini coefficient (normalized): `{metrics['qini_auc']:+.4f}` (random null `{metrics['qini_null']:+.4f}`)",
+        "- Treatment: additive surcharge versus the base fare. Outcome: driver accepts.",
+        "- Features: `distance_km`, `duration_sec`, `hour_of_day`, `past_trips`, `avg_surge`. "
+        "`price` and `surge_bonus` are not features.",
+        f"- Holdout Qini: `{metrics['qini_auc']:+.4f}`, "
+        f"95% bootstrap `[{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]` "
+        f"on {metrics['qini_boot']} resamples of this one split."
+        + (
+            " The interval contains 0, so the point estimate on this split is not separated from noise."
+            if metrics["qini_low"] < 0 < metrics["qini_high"]
+            else ""
+        ),
+        f"- Random-score Qini: mean `{metrics['qini_random_mean']:+.4f}`, "
+        f"95% `[{metrics['qini_random_low']:+.4f}, {metrics['qini_random_high']:+.4f}]` "
+        f"over {metrics['qini_random_draws']} draws. One random draw is not a null.",
         f"- Holdout Uplift@30%: `{metrics['uplift_at_k']:+.4f}`",
         f"- CPE `/health`: `{json.dumps(health, ensure_ascii=False)}`",
         "",
-        "## Honest roles → live CPE → DPE policy rule",
+        "## Calibration",
         "",
-        "DPE policy (same as production code): "
-        "`if uplift_score < -threshold → causal_override, base fare, CAUSAL_NO_SURGE`.",
+        "The planted cuts sit on columns the model receives. The mean score in a",
+        "segment is the calibration check. The rows below are the extreme scores",
+        "on the holdout, so their τ̂ is not the segment mean and is not a success",
+        "metric by itself.",
+        "",
+        "```text",
+        format_calibration(metrics["calibration"]),
+        "```",
+        "",
+        "## Extreme scores → live CPE → DPE policy",
+        "",
+        "DPE applies this only on an additive hour that names a driver: "
+        "`if uplift_score < -threshold → base fare, CAUSAL_NO_SURGE`.",
         "",
     ]
     for row in rows:
         lines.append(f"### `{row['role']}` — {row['label']}")
         lines.append("")
-        lines.append(f"- Offline τ̂ (holdout pick): `{row['offline_uplift']:+.4f}`")
+        planted = row.get("planted_uplift")
+        planted_text = "n/a" if planted is None else f"{planted:+.2f}"
+        lines.append(
+            f"- Offline τ̂ (extreme holdout row): `{row['offline_uplift']:+.4f}`. "
+            f"Planted effect on this same row: `{planted_text}`."
+        )
+        if planted is not None and abs(float(planted)) > 1e-9:
+            ratio = float(row["offline_uplift"]) / float(planted)
+            if abs(ratio) >= 1.5:
+                lines.append(
+                    f"- This row's score is {ratio:.1f} times the planted effect on the same row. "
+                    "That is miscalibration of an extreme score, not a confirmed effect."
+                )
         lines.append("- HTTP `POST /predict_uplift` response:")
         lines.append("```json")
         lines.append(json.dumps(row["http_response"], indent=2, ensure_ascii=False))
@@ -314,13 +384,20 @@ def _write_evidence(
 
     sd = next(r for r in rows if r["role"] == "sleeping_dog")
     assert sd["dpe_policy_simulation"]["causal_override"] is True
+    planted = sd.get("planted_uplift")
+    planted_text = "unknown" if planted is None else f"{float(planted):+.2f}"
     lines.extend(
         [
-            "## Sleeping Dog takeaway",
+            "## What the lowest score does",
             "",
             f"Captured uplift `{sd['http_response']['uplift_score']:+.4f}` "
-            f"→ treatment `{sd['http_response']['recommended_treatment']}` "
-            f"→ **causal_override = true** (surge suppressed in DPE policy).",
+            f"→ `{sd['http_response']['recommended_treatment']}` "
+            "→ DPE would charge the base fare.",
+            f"The planted effect on that same row is `{planted_text}`. "
+            "The row was chosen because its score is the minimum, not because it "
+            "belongs to the sleeping-dog cut. If the planted effect is near zero, "
+            "the override fires where the surcharge was not harmful.",
+            "The segment means above are the calibration check. This row is not.",
             "",
         ]
     )

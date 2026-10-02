@@ -68,9 +68,14 @@ class DataConfig(BaseModel):
 
 
 class DpeConfig(BaseModel):
-    """DPE connector and database settings."""
+    """DPE connector and database settings.
 
-    db_path: str = "Z:/pet-project/dynamic-pricing-engine/dpe_database.db"
+    Empty means "resolve a sibling checkout or ``/app/data``". A drive letter
+    is not a default. Override with ``CPE_DPE__DB_PATH`` when the file lives
+    somewhere else.
+    """
+
+    db_path: str = ""
 
 
 class AppConfig(BaseSettings):

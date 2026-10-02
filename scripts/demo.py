@@ -31,12 +31,17 @@ from sklearn.model_selection import train_test_split
 
 from src.api.main import recommend_treatment
 from src.causal.uplift_models import TLearner
-from src.data.dpe_connector import DPE_FEATURE_COLUMNS, load_dpe_data, resolve_dpe_db_path
-from src.data.synthetic import generate_uplift_dataset
-from src.evaluation.metrics import qini_auc_score, uplift_at_k
+from src.data.dpe_connector import describe_switchback, load_dpe_data, resolve_dpe_db_path
+from src.data.synthetic import (
+    FEATURE_COLUMNS,
+    format_calibration,
+    generate_uplift_dataset,
+    summarize_calibration,
+)
+from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval, uplift_at_k
 
 DEFAULT_THRESHOLD = 0.05
-FEATURE_COLS = list(DPE_FEATURE_COLUMNS)
+FEATURE_COLS = list(FEATURE_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -48,37 +53,33 @@ class ScenarioPick:
     features: dict[str, float]
     uplift: float
     row_index: int
+    true_uplift: float | None = None
 
 
 def load_demo_frame(source: str = "auto") -> tuple[pd.DataFrame, str]:
     """Load demo training data.
 
-    ``auto`` prefers synthetic for guaranteed heterogeneous TE (honest
-    quadrant demo). Use ``dpe`` to force simulation DB; falls back to
-    synthetic with an explicit notice if DB is missing or too small.
+    ``synthetic`` and ``auto`` randomize an additive surcharge per offer.
+    ``dpe`` prints the switchback design and does not return a training frame.
     """
     source = source.lower().strip()
-    db_path = resolve_dpe_db_path()
-
-    if source == "synthetic":
-        df = generate_uplift_dataset(n=3000, random_state=42)
-        return df, "synthetic (n=3000, seeded HTE)"
-
     if source == "dpe":
+        db_path = resolve_dpe_db_path()
         if not db_path.exists():
-            print(f"[!] DPE DB not found at {db_path}; falling back to synthetic.")
-            df = generate_uplift_dataset(n=3000, random_state=42)
-            return df, "synthetic fallback (DPE DB missing)"
-        df = load_dpe_data(db_path=db_path)
-        return df, f"DPE SQLite ({db_path.name}, n={len(df)})"
+            raise FileNotFoundError(f"DPE DB not found at {db_path}")
+        frame = load_dpe_data(db_path=db_path)
+        raise SwitchbackLog(describe_switchback(frame)["report"])
 
-    # auto: synthetic first for portfolio honesty / reproducibility
-    # (DPE still available via --source dpe)
     df = generate_uplift_dataset(n=3000, random_state=42)
-    note = "synthetic (n=3000, seeded HTE)"
-    if db_path.exists():
-        note += f" | DPE DB available at {db_path.name} (use --source dpe to train on it)"
+    note = (
+        "synthetic n=3000. Treatment is an additive surcharge versus the base fare, "
+        "randomized per offer. Outcome is driver acceptance."
+    )
     return df, note
+
+
+class SwitchbackLog(Exception):
+    """Raised when a caller asks the demo to train on the DPE hour-arm log."""
 
 
 def pick_honest_scenarios(
@@ -86,6 +87,7 @@ def pick_honest_scenarios(
     uplift: np.ndarray,
     feature_cols: list[str],
     threshold: float = DEFAULT_THRESHOLD,
+    true_uplift: np.ndarray | None = None,
 ) -> list[ScenarioPick]:
     """Pick three validation rows whose scores match scenario semantics.
 
@@ -132,27 +134,35 @@ def pick_honest_scenarios(
     def _row(i: int) -> dict[str, float]:
         return {c: float(X[i, j]) for j, c in enumerate(feature_cols)}
 
+    def _planted(i: int) -> float | None:
+        if true_uplift is None:
+            return None
+        return float(np.asarray(true_uplift, dtype=float).ravel()[i])
+
     return [
         ScenarioPick(
-            label="Persuadable — treatment likely helps",
+            label="Highest score — surcharge looks helpful on this row",
             role="persuadable",
             features=_row(idx_pos),
             uplift=u_pos,
             row_index=idx_pos,
+            true_uplift=_planted(idx_pos),
         ),
         ScenarioPick(
-            label="Neutral — little incremental effect",
+            label="Score nearest zero",
             role="neutral",
             features=_row(idx_neu),
             uplift=float(uplift[idx_neu]),
             row_index=idx_neu,
+            true_uplift=_planted(idx_neu),
         ),
         ScenarioPick(
-            label="Sleeping Dog — treatment likely hurts",
+            label="Lowest score — surcharge looks harmful on this row",
             role="sleeping_dog",
             features=_row(idx_neg),
             uplift=u_neg,
             row_index=idx_neg,
+            true_uplift=_planted(idx_neg),
         ),
     ]
 
@@ -175,33 +185,44 @@ def assert_scenario_honesty(
         raise AssertionError("Neutral |uplift| should not exceed sleeping dog")
 
 
-def _action_line(treatment: str, discount: float) -> str:
-    if treatment == "DISCOUNT_10_PCT" or discount > 0:
-        return f"Act: offer treatment / discount ({discount:.0f}%)"
-    if treatment == "NO_DISCOUNT_AVOID":
-        return "Act: suppress surge / avoid treatment (Sleeping Dog)"
-    return "Act: keep baseline fare (no incremental treatment)"
+def _action_line(treatment: str) -> str:
+    if treatment == "SURCHARGE":
+        return "Act: keep the additive surcharge"
+    if treatment == "NO_SURCHARGE":
+        return "Act: charge the base fare (no surcharge)"
+    return "Act: keep the quote (score inside the threshold)"
 
 
-def run_demo(source: str = "auto", threshold: float = DEFAULT_THRESHOLD) -> int:
+def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) -> int:
     print("=" * 64)
-    print("  Causal Pricing Engine — Honest Portfolio Demo")
+    print("  Causal Pricing Engine — surcharge versus base fare")
     print("=" * 64)
     print(
-        "Scenarios are real validation rows ranked by predicted τ(x),\n"
-        "not hand-picked feature vectors with decorative labels.\n"
+        "The three rows below are the highest score, a score near zero, and the\n"
+        "lowest score on the holdout. They are not a discovered segment.\n"
     )
 
-    df, source_label = load_demo_frame(source=source)
+    try:
+        df, source_label = load_demo_frame(source=source)
+    except SwitchbackLog as exc:
+        print(str(exc))
+        print("[*] The demo model is not fit on this log.")
+        return 0
+    except FileNotFoundError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
     print(f"[*] Data: {source_label}")
 
-    X = df[FEATURE_COLS].to_numpy(dtype=float)
-    y = df["conversion"].to_numpy(dtype=int)
-    t = df["treatment"].to_numpy(dtype=int)
-
-    X_train, X_val, y_train, y_val, t_train, t_val = train_test_split(
-        X, y, t, test_size=0.3, random_state=42, stratify=t
+    idx = np.arange(len(df))
+    idx_train, idx_val = train_test_split(
+        idx, test_size=0.3, random_state=42, stratify=df["treatment"].to_numpy()
     )
+    X = df[FEATURE_COLS].to_numpy(dtype=float)
+    y = df["accepted"].to_numpy(dtype=int)
+    t = df["treatment"].to_numpy(dtype=int)
+    X_train, X_val = X[idx_train], X[idx_val]
+    y_train, y_val = y[idx_train], y[idx_val]
+    t_train, t_val = t[idx_train], t[idx_val]
 
     print("[*] Training T-Learner (GradientBoostingClassifier)...")
     model = TLearner(
@@ -212,25 +233,41 @@ def run_demo(source: str = "auto", threshold: float = DEFAULT_THRESHOLD) -> int:
     model.fit(X_train, y_train, t_train)
 
     val_uplift = model.predict_uplift(X_val)
-    qini = qini_auc_score(y_val, val_uplift, t_val)  # normalized coefficient ~[-1, 1]
+    qini = qini_bootstrap_interval(y_val, val_uplift, t_val, n_boot=200, seed=0)
+    qini_null = qini_random_interval(y_val, t_val, n_draws=200, seed=1)
     u_at_30 = uplift_at_k(y_val, val_uplift, t_val, k=0.3)
-    # Null bar: random scores should land near 0
-    rng = np.random.default_rng(0)
-    qini_null = qini_auc_score(y_val, rng.normal(size=len(y_val)), t_val)
-    print(f"[*] Holdout Qini coefficient: {qini:+.4f}  (normalized; random null {qini_null:+.4f})")
-    print(f"[*] Holdout Uplift@30%:       {u_at_30:+.4f}")
-    print(f"[*] Decision threshold:       ±{threshold}")
+    print(
+        f"[*] Holdout Qini: {qini['point']:+.4f}  "
+        f"95% bootstrap [{qini['low']:+.4f}, {qini['high']:+.4f}] "
+        f"({qini['n_boot']} resamples of this one split)"
+    )
+    if qini["low"] < 0 < qini["high"]:
+        print("[*] That interval contains 0. The point estimate on this split is not separated from noise.")
+    print(
+        f"[*] Random-score Qini: mean {qini_null['mean']:+.4f}  "
+        f"95% [{qini_null['low']:+.4f}, {qini_null['high']:+.4f}] "
+        f"over {qini_null['n_draws']} draws. One draw is not a null."
+    )
+    print(f"[*] Holdout Uplift@30%: {u_at_30:+.4f}")
+    print(f"[*] Decision threshold: ±{threshold}")
+    calibration = summarize_calibration(
+        df["segment"].to_numpy()[idx_val],
+        df["true_uplift"].to_numpy()[idx_val],
+        val_uplift,
+    )
+    print("[*] Calibration of the mean score against the planted effect:")
+    print(format_calibration(calibration))
 
     try:
         scenarios = pick_honest_scenarios(
-            X_val, val_uplift, FEATURE_COLS, threshold=threshold
+            X_val,
+            val_uplift,
+            FEATURE_COLS,
+            threshold=threshold,
+            true_uplift=df["true_uplift"].to_numpy()[idx_val],
         )
         assert_scenario_honesty(scenarios, threshold=threshold)
     except (RuntimeError, AssertionError) as exc:
-        if source != "synthetic":
-            print(f"[!] Honest pick failed on this data: {exc}")
-            print("[*] Retrying with synthetic HTE data...")
-            return run_demo(source="synthetic", threshold=threshold)
         print(f"[FAIL] {exc}")
         return 1
 
@@ -244,34 +281,43 @@ def run_demo(source: str = "auto", threshold: float = DEFAULT_THRESHOLD) -> int:
             "model_name": "t_learner",
             "feature_columns": FEATURE_COLS,
             "source": source_label,
-            "metrics": {"qini_auc": float(qini), "uplift_at_k": float(u_at_30)},
+            "metrics": {
+                "qini_auc": float(qini["point"]),
+                "qini_low": float(qini["low"]),
+                "qini_high": float(qini["high"]),
+                "uplift_at_k": float(u_at_30),
+            },
             "uplift_threshold": float(threshold),
         },
         artifact_path,
     )
     print(f"[*] Saved artifact: {artifact_path}")
 
-    print("\n### Honest uplift decisions (from holdout rows)\n")
     print(
-        "| Role | τ̂ (uplift) | past_trips | surge_bonus | Treatment | Policy |"
+        "\n### Extreme holdout scores\n"
+        "The planted value on the row is the segment constant, not a target the\n"
+        "row was chosen to match. A large gap is miscalibration.\n"
     )
-    print("|:---|:---:|:---:|:---:|:---|:---|")
+    print(
+        "| Role | τ̂ | planted on this row | past_trips | distance_km | Action | Policy |"
+    )
+    print("|:---|:---:|:---:|:---:|:---:|:---|:---|")
 
     for sc in scenarios:
-        treatment, discount = recommend_treatment(sc.uplift, threshold=threshold)
-        # Sanity: treatment code must agree with score sign bands
-        if sc.role == "persuadable" and treatment != "DISCOUNT_10_PCT":
-            print(f"[FAIL] Persuadable got treatment={treatment}")
+        treatment = recommend_treatment(sc.uplift, threshold=threshold)
+        if sc.role == "persuadable" and treatment != "SURCHARGE":
+            print(f"[FAIL] Highest score got treatment={treatment}")
             return 1
-        if sc.role == "sleeping_dog" and treatment != "NO_DISCOUNT_AVOID":
-            print(f"[FAIL] Sleeping Dog got treatment={treatment}")
+        if sc.role == "sleeping_dog" and treatment != "NO_SURCHARGE":
+            print(f"[FAIL] Lowest score got treatment={treatment}")
             return 1
 
         feats = sc.features
+        planted = "n/a" if sc.true_uplift is None else f"{sc.true_uplift:+.2f}"
         print(
-            f"| **{sc.role}** | {sc.uplift:+.4f} | "
-            f"{feats.get('past_trips', 0):.0f} | {feats.get('surge_bonus', 0):.1f} | "
-            f"`{treatment}` | {_action_line(treatment, discount)} |"
+            f"| **{sc.role}** | {sc.uplift:+.4f} | {planted} | "
+            f"{feats.get('past_trips', 0):.0f} | {feats.get('distance_km', 0):.1f} | "
+            f"`{treatment}` | {_action_line(treatment)} |"
         )
 
     print("\nFeature vectors (for reproducibility):\n")
@@ -291,8 +337,8 @@ def main() -> None:
     parser.add_argument(
         "--source",
         choices=["auto", "synthetic", "dpe"],
-        default="auto",
-        help="auto=synthetic HTE (default, honest); dpe=simulation DB; synthetic=force",
+        default="synthetic",
+        help="synthetic (default) randomizes the surcharge. dpe prints the switchback design and does not train.",
     )
     parser.add_argument(
         "--threshold",

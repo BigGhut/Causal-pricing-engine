@@ -232,3 +232,73 @@ def uplift_by_percentile(
         )
 
     return pd.DataFrame(rows)
+
+
+def qini_bootstrap_interval(
+    y: np.ndarray | pd.Series,
+    uplift: np.ndarray | pd.Series,
+    treatment: np.ndarray | pd.Series,
+    *,
+    n_boot: int = 200,
+    seed: int = 0,
+    alpha: float = 0.05,
+) -> dict[str, float | int]:
+    """Percentile interval for the Qini coefficient on one holdout.
+
+    Each draw resamples rows with replacement and recomputes the coefficient.
+    Draws that miss an arm are skipped.
+    """
+    y_arr, u_arr, t_arr = _as_1d(y, uplift, treatment)
+    n = len(y_arr)
+    point = float(qini_auc_score(y_arr, u_arr, t_arr))
+    if n == 0 or n_boot <= 0:
+        return {"point": point, "low": point, "high": point, "n_boot": 0}
+
+    rng = np.random.default_rng(seed)
+    scores: list[float] = []
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, n, size=n)
+        if len(np.unique(t_arr[idx])) < 2:
+            continue
+        scores.append(float(qini_auc_score(y_arr[idx], u_arr[idx], t_arr[idx])))
+    if not scores:
+        return {"point": point, "low": point, "high": point, "n_boot": 0}
+    arr = np.asarray(scores, dtype=float)
+    tail = alpha / 2.0
+    return {
+        "point": point,
+        "low": float(np.quantile(arr, tail)),
+        "high": float(np.quantile(arr, 1.0 - tail)),
+        "n_boot": int(len(arr)),
+    }
+
+
+def qini_random_interval(
+    y: np.ndarray | pd.Series,
+    treatment: np.ndarray | pd.Series,
+    *,
+    n_draws: int = 200,
+    seed: int = 1,
+    alpha: float = 0.05,
+) -> dict[str, float | int]:
+    """Distribution of the Qini coefficient under random scores.
+
+    One random score is one draw from this distribution, not a null by itself.
+    """
+    y_arr, t_arr = _as_1d(y, treatment)
+    n = len(y_arr)
+    if n == 0 or n_draws <= 0:
+        return {"mean": 0.0, "low": 0.0, "high": 0.0, "n_draws": 0}
+    rng = np.random.default_rng(seed)
+    scores = [
+        float(qini_auc_score(y_arr, rng.normal(size=n), t_arr))
+        for _ in range(int(n_draws))
+    ]
+    arr = np.asarray(scores, dtype=float)
+    tail = alpha / 2.0
+    return {
+        "mean": float(arr.mean()),
+        "low": float(np.quantile(arr, tail)),
+        "high": float(np.quantile(arr, 1.0 - tail)),
+        "n_draws": int(len(arr)),
+    }

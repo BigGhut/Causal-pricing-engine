@@ -79,14 +79,22 @@ def score_uplift(features: dict[str, float]) -> float:
     return float(np.asarray(scores).ravel()[0])
 
 
-def recommend_treatment(uplift_score: float, threshold: float | None = None) -> tuple[str, float]:
-    """Map uplift score to a treatment recommendation."""
+def recommend_treatment(uplift_score: float, threshold: float | None = None) -> str:
+    """Map the surcharge effect to one action.
+
+    The score is the change in driver-acceptance probability from adding the
+    surcharge to the base fare. It is not a discount.
+
+    ``SURCHARGE``: the surcharge raises acceptance.
+    ``KEEP_QUOTE``: the score is inside the threshold, so the quote stands.
+    ``NO_SURCHARGE``: the surcharge lowers acceptance. DPE then charges the base fare.
+    """
     thr = threshold if threshold is not None else float(_MODEL_STATE.get("uplift_threshold", 0.05))
     if uplift_score > thr:
-        return "DISCOUNT_10_PCT", 10.0
+        return "SURCHARGE"
     if uplift_score < -thr:
-        return "NO_DISCOUNT_AVOID", 0.0
-    return "NO_DISCOUNT", 0.0
+        return "NO_SURCHARGE"
+    return "KEEP_QUOTE"
 
 
 def apply_model_payload(payload: dict[str, Any]) -> None:
@@ -129,15 +137,13 @@ app = FastAPI(
 
 
 class PredictUpliftRequest(BaseModel):
-    user_id: str
+    driver_id: str
     features: dict[str, float] = Field(
         ...,
         examples=[
             {
                 "distance_km": 7.0,
                 "duration_sec": 900.0,
-                "price": 350.0,
-                "surge_bonus": 50.0,
                 "hour_of_day": 18.0,
                 "past_trips": 12.0,
                 "avg_surge": 1.25,
@@ -147,10 +153,9 @@ class PredictUpliftRequest(BaseModel):
 
 
 class PredictUpliftResponse(BaseModel):
-    user_id: str
+    driver_id: str
     uplift_score: float
     recommended_treatment: str
-    optimal_discount_pct: float
     model_name: str | None = None
 
 
@@ -192,15 +197,14 @@ def predict_uplift(request: PredictUpliftRequest) -> PredictUpliftResponse:
 
     t0 = time.perf_counter()
     uplift_score = score_uplift(request.features)
-    treatment, discount = recommend_treatment(uplift_score)
+    treatment = recommend_treatment(uplift_score)
     dt_ms = (time.perf_counter() - t0) * 1000.0
     print(f"[CPE API] /predict_uplift latency: {dt_ms:.2f} ms")
 
     return PredictUpliftResponse(
-        user_id=request.user_id,
+        driver_id=request.driver_id,
         uplift_score=uplift_score,
         recommended_treatment=treatment,
-        optimal_discount_pct=discount,
         model_name=_MODEL_STATE.get("model_name"),
     )
 

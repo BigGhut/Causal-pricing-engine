@@ -16,21 +16,21 @@ import pandas as pd
 from scipy import stats
 
 from src.config import load_config
-from src.data.dpe_connector import load_dpe_data
+from src.data.dpe_connector import describe_switchback, load_dpe_data
 from src.data.synthetic import generate_uplift_dataset
 from src.experiments.power_analysis import cuped_adjust, sample_size_calculator
 
 
 def evaluate_experiment(
-    source: str = "dpe",
+    source: str = "synthetic",
     dpe_db_path: str | Path | None = None,
     covariate_col: str = "past_trips",
-    target_col: str = "conversion",
+    target_col: str = "accepted",
 ) -> dict:
     """Evaluate experiment with CUPED variance reduction and hypothesis testing.
 
     Args:
-        source: Data source ("dpe" or "synthetic").
+        source: ``synthetic`` evaluates the randomized surcharge. ``dpe`` describes the switchback and does not test rows.
         dpe_db_path: Path to DPE SQLite database.
         covariate_col: Pre-experiment covariate for CUPED adjustment.
         target_col: Experiment outcome variable name.
@@ -41,9 +41,16 @@ def evaluate_experiment(
     cfg = load_config()
 
     if source.lower() == "dpe":
-        df = load_dpe_data(db_path=dpe_db_path)
-    else:
-        df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=cfg.data.random_state)
+        frame = load_dpe_data(db_path=dpe_db_path)
+        design = describe_switchback(frame)
+        return {
+            "source": "dpe",
+            "identified_ite": False,
+            "design": design,
+            "markdown_report": design["report"],
+        }
+
+    df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=cfg.data.random_state)
 
     if covariate_col not in df.columns:
         raise ValueError(f"Covariate '{covariate_col}' not found in dataframe columns.")
@@ -124,8 +131,8 @@ def evaluate_experiment(
 | Data Source                     | `{source}`               |
 | Control Sample Size (n_c)       | {n_c}                    |
 | Treatment Sample Size (n_t)     | {n_t}                    |
-| Control Conversion Rate         | {mean_c_raw:.4f}         |
-| Treatment Conversion Rate       | {mean_t_raw:.4f}         |
+| Control acceptance rate         | {mean_c_raw:.4f}         |
+| Treated acceptance rate         | {mean_t_raw:.4f}         |
 | Raw Delta                       | {raw_delta:+.4f}         |
 | CUPED Delta ({covariate_col})    | {cuped_delta:+.4f}        |
 | p-value (CUPED t-test)          | {p_value:.4f}            |
@@ -174,8 +181,8 @@ def main() -> None:
     parser.add_argument(
         "--source",
         choices=["dpe", "synthetic"],
-        default="dpe",
-        help="Data source: dpe (default) or synthetic",
+        default="synthetic",
+        help="synthetic (default) is the randomized surcharge. dpe prints the switchback design and does not run a row-level test.",
     )
     parser.add_argument(
         "--dpe-db-path",

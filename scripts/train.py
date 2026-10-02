@@ -20,12 +20,7 @@ from sklearn.model_selection import train_test_split
 from src.causal.dml_engine import DMLEngine
 from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearner
 from src.config import load_config
-from src.data.dpe_connector import (
-    DPE_FEATURE_COLUMNS,
-    DPE_PRE_TREATMENT_FEATURES,
-    load_dpe_data,
-    resolve_dpe_db_path,
-)
+from src.data.dpe_connector import describe_switchback, load_dpe_data
 from src.data.synthetic import FEATURE_COLUMNS, generate_uplift_dataset
 from src.evaluation.metrics import qini_auc_score, uplift_at_k
 
@@ -63,49 +58,46 @@ def _build_base_estimator(name: str, n_estimators: int, learning_rate: float, ra
 
 
 def train_and_select(
-    source: str = "auto",
+    source: str = "synthetic",
     dpe_db_path: str | Path | None = None,
     random_state: int | None = None,
     learners: list[str] | None = None,
     include_all: bool = False,
-    feature_mode: str = "serve_parity",
+    feature_mode: str = "pre_treatment",
 ) -> dict:
-    """Generate or load data, train candidates, pick best by Qini AUC, dump artifact.
+    """Fit the surcharge model on synthetic randomized offers.
 
-    Args:
-        source: Data source type ("auto", "synthetic", or "dpe"). "auto" picks dpe if DB exists, else synthetic.
-        dpe_db_path: Optional custom path to DPE SQLite database.
-        random_state: Random state seed.
-        learners: Optional list of learner names ("t_learner", "s_learner", "x_learner", "dml"). Default is ["t_learner"].
-        include_all: If True, train all available candidates (t, s, x, dml).
-        feature_mode: "serve_parity" (default) or "pre_treatment" (for DPE source).
+    ``source='dpe'`` does not fit a model. Those rows are a switchback of two
+    surge formulas, assigned by virtual hour. The function prints that design
+    and returns without writing an artifact.
 
-    Returns:
-        Dict with metrics and paths for programmatic checks.
+    ``feature_mode`` applies only to the DPE summary. The default is
+    ``pre_treatment`` (no price, no surge_bonus).
     """
     cfg = load_config()
     rs = random_state if random_state is not None else cfg.data.random_state
 
-    resolved_db = resolve_dpe_db_path(dpe_db_path)
     source_clean = source.lower()
     if source_clean == "auto":
-        source_clean = "dpe" if resolved_db.exists() else "synthetic"
+        source_clean = "synthetic"
 
     if source_clean == "dpe":
-        print(f"Loading DPE simulation dataset from {resolved_db} (mode={feature_mode})...")
-        df = load_dpe_data(db_path=resolved_db, feature_mode=feature_mode)
-        feature_cols = (
-            DPE_PRE_TREATMENT_FEATURES
-            if feature_mode == "pre_treatment"
-            else DPE_FEATURE_COLUMNS
-        )
-    else:
-        print(f"Generating synthetic uplift dataset (n={cfg.data.n_samples})...")
-        df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=rs)
-        feature_cols = FEATURE_COLUMNS
+        frame = load_dpe_data(db_path=dpe_db_path, feature_mode=feature_mode)
+        design = describe_switchback(frame)
+        print(design["report"])
+        print("\nNo model artifact written. Train with --source synthetic.")
+        return {"refused": True, "identified_ite": False, "design": design}
+
+    print(
+        f"Generating synthetic offers (n={cfg.data.n_samples}). "
+        "Treatment is an additive surcharge versus the base fare, "
+        "randomized per offer. Outcome is driver acceptance."
+    )
+    df = generate_uplift_dataset(n=cfg.data.n_samples, random_state=rs)
+    feature_cols = FEATURE_COLUMNS
 
     X = df[feature_cols].to_numpy(dtype=float)
-    y = df["conversion"].to_numpy(dtype=int)
+    y = df["accepted"].to_numpy(dtype=int)
     treatment = df["treatment"].to_numpy(dtype=int)
 
     X_train, X_test, y_train, y_test, t_train, t_test = train_test_split(
@@ -183,8 +175,10 @@ def train_and_select(
     print(f"Uplift@k:    {results[best_name]['uplift_at_k']:.4f}")
     print(f"Saved to:    {model_path}")
     print(
-        "Portfolio Note: Model artifact saved with train/serve parity feature contract (DPE_FEATURE_COLUMNS).\n"
-        "Runtime DPE integration checks /predict_uplift at :8100 with fail-open fallback."
+        "Features are pre-treatment only: "
+        + ", ".join(feature_cols)
+        + ".\nprice and surge_bonus are not in the model. "
+        "DPE calls /predict_uplift only for an additive hour that names a driver."
     )
 
     return {
@@ -199,8 +193,8 @@ def main() -> None:
     parser.add_argument(
         "--source",
         choices=["auto", "synthetic", "dpe"],
-        default="auto",
-        help="Data source: auto (default, picks DPE if DB exists), synthetic, or dpe",
+        default="synthetic",
+        help="synthetic (default) randomizes the surcharge. dpe only prints the switchback design and does not fit a model. auto is synthetic.",
     )
     parser.add_argument(
         "--dpe-db-path",
@@ -222,8 +216,8 @@ def main() -> None:
     parser.add_argument(
         "--feature-mode",
         choices=["serve_parity", "pre_treatment"],
-        default="serve_parity",
-        help="Feature mode for DPE source: serve_parity (default, 7 features) or pre_treatment (5 features)",
+        default="pre_treatment",
+        help="DPE summary only. pre_treatment (default) omits price and surge_bonus. serve_parity keeps them for inspection.",
     )
     args = parser.parse_args()
 

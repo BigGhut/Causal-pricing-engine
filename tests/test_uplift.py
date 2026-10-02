@@ -90,7 +90,7 @@ def test_meta_learners_detect_heterogeneity():
 
     df = generate_uplift_dataset(n=2000, random_state=7)
     X = df[FEATURE_COLUMNS].to_numpy()
-    y = df["conversion"].to_numpy()
+    y = df["accepted"].to_numpy()
     t = df["treatment"].to_numpy()
     seg = df["segment"].to_numpy()
 
@@ -214,7 +214,7 @@ def test_sample_size_calculator():
 def test_qini_and_uplift_at_k_on_labeled_data():
     df = generate_uplift_dataset(n=800, random_state=3)
     X = df[FEATURE_COLUMNS].to_numpy()
-    y = df["conversion"].to_numpy()
+    y = df["accepted"].to_numpy()
     t = df["treatment"].to_numpy()
 
     # Holdout only — avoid train=test optimism for metric checks
@@ -247,7 +247,7 @@ def test_qini_beats_random_on_holdout():
 
     df = generate_uplift_dataset(n=1500, random_state=42)
     X = df[FEATURE_COLUMNS].to_numpy()
-    y = df["conversion"].to_numpy()
+    y = df["accepted"].to_numpy()
     t = df["treatment"].to_numpy()
 
     X_tr, X_te, y_tr, y_te, t_tr, t_te = train_test_split(
@@ -270,7 +270,7 @@ def test_qini_beats_random_on_holdout():
 def test_qini_normalized_oracle_and_null():
     """Normalized Qini: random ≈ 0, oracle ≈ 1, unnormalized not O(n²)."""
     df = generate_uplift_dataset(n=1200, random_state=7)
-    y = df["conversion"].to_numpy()
+    y = df["accepted"].to_numpy()
     t = df["treatment"].to_numpy()
     # Oracle score used in denominator definition
     oracle = y * (2.0 * t - 1.0)
@@ -285,6 +285,21 @@ def test_qini_normalized_oracle_and_null():
     q_raw = qini_auc_score(y, oracle, t, normalize=False)
     assert abs(q_raw) < len(y)  # previously was ~n² scale (~1e6)
     assert abs(q_raw) > 1.0  # still a real positive area for structured data
+
+
+def test_qini_interval_is_a_distribution_not_one_draw():
+    from src.evaluation.metrics import qini_bootstrap_interval, qini_random_interval
+
+    df = generate_uplift_dataset(n=400, random_state=3)
+    y = df["accepted"].to_numpy()
+    t = df["treatment"].to_numpy()
+    scores = df["true_uplift"].to_numpy()
+    interval = qini_bootstrap_interval(y, scores, t, n_boot=30, seed=0)
+    null = qini_random_interval(y, t, n_draws=30, seed=1)
+    assert interval["n_boot"] >= 20
+    assert interval["low"] <= interval["high"]
+    assert null["n_draws"] == 30
+    assert null["low"] <= null["mean"] <= null["high"]
 
 
 def test_uplift_by_percentile_shape():
@@ -304,22 +319,27 @@ def test_uplift_by_percentile_shape():
 def test_synthetic_dataset_schema_and_heterogeneity():
     df = generate_uplift_dataset(n=3000, random_state=11)
     required = {
-        "user_id",
+        "driver_id",
         "treatment",
-        "conversion",
+        "accepted",
         "revenue",
         *FEATURE_COLUMNS,
     }
     assert required.issubset(df.columns)
     assert set(df["treatment"].unique()).issubset({0, 1})
-    assert set(df["conversion"].unique()).issubset({0, 1})
+    assert set(df["accepted"].unique()).issubset({0, 1})
     assert df["revenue"].dtype.kind == "f"
+    assert "price" not in FEATURE_COLUMNS
+    assert "surge_bonus" not in df.columns
+    fare = df["base_fare"] + df["treatment"] * df["surcharge_rub"]
+    expected_revenue = fare.where(df["accepted"] == 1, 0.0)
+    assert np.allclose(df["revenue"], expected_revenue)
 
     # Empirical ATE by segment
     def ate(segment_val: float) -> float:
         sub = df[df["segment"] == segment_val]
-        y1 = sub.loc[sub["treatment"] == 1, "conversion"].mean()
-        y0 = sub.loc[sub["treatment"] == 0, "conversion"].mean()
+        y1 = sub.loc[sub["treatment"] == 1, "accepted"].mean()
+        y0 = sub.loc[sub["treatment"] == 0, "accepted"].mean()
         return float(y1 - y0)
 
     ate_pos = ate(2.0)
@@ -432,7 +452,7 @@ def test_api_scoring_path_with_real_artifact(tmp_path: Path):
 
     df = generate_uplift_dataset(n=400, random_state=5)
     X = df[FEATURE_COLUMNS].to_numpy()
-    y = df["conversion"].to_numpy()
+    y = df["accepted"].to_numpy()
     t = df["treatment"].to_numpy()
 
     model = SLearner(base_estimator=LogisticRegression(max_iter=500))
@@ -459,9 +479,8 @@ def test_api_scoring_path_with_real_artifact(tmp_path: Path):
     direct = float(model.predict_uplift(X[0:1])[0])
     assert abs(score - direct) < 1e-9
 
-    treatment, discount = recommend_treatment(score, threshold=0.05)
-    assert treatment in {"DISCOUNT_10_PCT", "NO_DISCOUNT", "NO_DISCOUNT_AVOID"}
-    assert isinstance(discount, float)
+    treatment = recommend_treatment(score, threshold=0.05)
+    assert treatment in {"SURCHARGE", "KEEP_QUOTE", "NO_SURCHARGE"}
 
     # Mock path removed: past_trips alone must not force fixed 0.15/0.02
     low_trips = {c: 0.0 for c in FEATURE_COLUMNS}
@@ -547,7 +566,7 @@ def test_predict_uplift_nan_validation(tmp_path: Path):
     client = TestClient(app)
     resp = client.post(
         "/predict_uplift",
-        content='{"user_id": "u1", "features": {"past_trips": null}}',
+        content='{"driver_id": "d1", "features": {"past_trips": null}}',
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 422

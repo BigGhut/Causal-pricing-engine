@@ -11,12 +11,15 @@ proof:
 	python scripts/portfolio_proof.py
 
 train:
-	python scripts/train.py
+	python scripts/train.py --source synthetic
 
 train-dpe:
 	python scripts/train.py --source dpe
 
 evaluate:
+	python scripts/evaluate_experiment.py --source synthetic
+
+summarize-dpe:
 	python scripts/evaluate_experiment.py --source dpe
 
 serve:
