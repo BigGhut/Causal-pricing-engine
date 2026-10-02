@@ -15,8 +15,6 @@ import joblib
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-
 from src.causal.dml_engine import DMLEngine
 from src.causal.uplift_models import BaseUpliftModel, SLearner, TLearner, XLearner
 from src.config import load_config
@@ -26,6 +24,7 @@ from src.evaluation.metrics import (
     holdout_decision,
     qini_auc_score,
     qini_bootstrap_interval,
+    split_train_calibration_test,
     uplift_at_k,
 )
 
@@ -104,10 +103,12 @@ def train_and_select(
     X = df[feature_cols].to_numpy(dtype=float)
     y = df["accepted"].to_numpy(dtype=int)
     treatment = df["treatment"].to_numpy(dtype=int)
-
-    X_train, X_test, y_train, y_test, t_train, t_test = train_test_split(
-        X, y, treatment, test_size=0.3, random_state=rs, stratify=treatment
+    train_idx, cal_idx, test_idx = split_train_calibration_test(
+        len(df), treatment, random_state=rs
     )
+    X_train, y_train, t_train = X[train_idx], y[train_idx], treatment[train_idx]
+    X_cal, y_cal, t_cal = X[cal_idx], y[cal_idx], treatment[cal_idx]
+    X_test, y_test, t_test = X[test_idx], y[test_idx], treatment[test_idx]
 
     base = _build_base_estimator(
         cfg.model.base_learner,
@@ -143,32 +144,56 @@ def train_and_select(
         print(f"Training {name}...")
         if name == "dml":
             model.fit(Y=y_train, T=t_train, X=X_train, W=None)
-            uplift = model.effect(X_test)
+            uplift_cal = model.effect(X_cal)
+            uplift_test = model.effect(X_test)
         else:
             model.fit(X_train, y_train, t_train)
-            uplift = model.predict_uplift(X_test)
+            uplift_cal = model.predict_uplift(X_cal)
+            uplift_test = model.predict_uplift(X_test)
 
-        qini = qini_auc_score(y_test, uplift, t_test)
-        u_at_k = uplift_at_k(y_test, uplift, t_test, k=0.3)
-        results[name] = {"qini_auc": float(qini), "uplift_at_k": float(u_at_k)}
-        print(f"  {name}: Qini coef={qini:+.4f}, Uplift@k={u_at_k:+.4f}")
+        qini = qini_auc_score(y_cal, uplift_cal, t_cal)
+        qini_test = qini_auc_score(y_test, uplift_test, t_test)
+        u_at_k = uplift_at_k(y_test, uplift_test, t_test, k=0.3)
+        results[name] = {
+            "qini_auc": float(qini),
+            "test_qini_auc": float(qini_test),
+            "uplift_at_k": float(u_at_k),
+        }
+        print(
+            f"  {name}: calibration Qini={qini:+.4f} (selection), "
+            f"untouched test Qini={qini_test:+.4f}, Uplift@k={u_at_k:+.4f}"
+        )
 
     # Select best by Qini AUC among trained candidates
     scores = {k: v["qini_auc"] for k, v in results.items()}
     best_name = max(scores, key=scores.get)  # type: ignore[arg-type]
     best_model = candidates[best_name]
     if best_name == "dml":
-        best_uplift = best_model.effect(X_test)
+        best_cal = best_model.effect(X_cal)
+        best_test = best_model.effect(X_test)
     else:
-        best_uplift = best_model.predict_uplift(X_test)
-    interval = qini_bootstrap_interval(y_test, best_uplift, t_test, n_boot=200, seed=rs)
-    results[best_name]["qini_low"] = float(interval["low"])
-    results[best_name]["qini_high"] = float(interval["high"])
-    results[best_name].update(holdout_decision(float(interval["low"])))
+        best_cal = best_model.predict_uplift(X_cal)
+        best_test = best_model.predict_uplift(X_test)
+    cal_interval = qini_bootstrap_interval(y_cal, best_cal, t_cal, n_boot=200, seed=rs)
+    test_interval = qini_bootstrap_interval(y_test, best_test, t_test, n_boot=200, seed=rs + 1)
+    results[best_name]["calibration_qini_low"] = float(cal_interval["low"])
+    results[best_name]["calibration_qini_high"] = float(cal_interval["high"])
+    results[best_name]["qini_low"] = float(test_interval["low"])
+    results[best_name]["qini_high"] = float(test_interval["high"])
+    results[best_name]["test_qini_auc"] = float(test_interval["point"])
+    results[best_name].update(holdout_decision(float(cal_interval["low"])))
+    print(
+        f"Calibration Qini 95% [{cal_interval['low']:+.4f}, {cal_interval['high']:+.4f}] "
+        f"sets ranking_supports_decision="
+        f"{results[best_name]['ranking_supports_decision']}."
+    )
+    print(
+        f"Untouched test Qini {test_interval['point']:+.4f} "
+        f"95% [{test_interval['low']:+.4f}, {test_interval['high']:+.4f}]."
+    )
     if not results[best_name]["ranking_supports_decision"]:
         print(
-            "Training set ranking_supports_decision=false: "
-            "holdout Qini lower bound is not above 0. "
+            "The calibration lower bound is not above 0. "
             "The false-override rate is not applied yet. "
             "A score below -0.05 does not change the fare."
         )

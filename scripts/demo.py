@@ -27,8 +27,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
-
 from src.api.main import recommend_treatment
 from src.causal.uplift_models import TLearner
 from src.data.dpe_connector import describe_switchback, load_dpe_data, resolve_dpe_db_path
@@ -42,6 +40,7 @@ from src.evaluation.metrics import (
     holdout_decision,
     qini_bootstrap_interval,
     qini_random_interval,
+    split_train_calibration_test,
     uplift_at_k,
 )
 
@@ -203,8 +202,8 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
     print("  Causal Pricing Engine — surcharge versus base fare")
     print("=" * 64)
     print(
-        "The three rows below are the highest score, a score near zero, and the\n"
-        "lowest score on the holdout. They are not a discovered segment.\n"
+        "The three rows below are extreme scores on the untouched test.\n"
+        "The decision flag uses only the other half of the holdout.\n"
     )
 
     try:
@@ -218,16 +217,13 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
         return 1
     print(f"[*] Data: {source_label}")
 
-    idx = np.arange(len(df))
-    idx_train, idx_val = train_test_split(
-        idx, test_size=0.3, random_state=42, stratify=df["treatment"].to_numpy()
-    )
+    treatment = df["treatment"].to_numpy(dtype=int)
+    idx_train, idx_cal, idx_test = split_train_calibration_test(len(df), treatment, random_state=42)
     X = df[FEATURE_COLS].to_numpy(dtype=float)
     y = df["accepted"].to_numpy(dtype=int)
-    t = df["treatment"].to_numpy(dtype=int)
-    X_train, X_val = X[idx_train], X[idx_val]
-    y_train, y_val = y[idx_train], y[idx_val]
-    t_train, t_val = t[idx_train], t[idx_val]
+    X_train, y_train, t_train = X[idx_train], y[idx_train], treatment[idx_train]
+    X_cal, y_cal, t_cal = X[idx_cal], y[idx_cal], treatment[idx_cal]
+    X_test, y_test, t_test = X[idx_test], y[idx_test], treatment[idx_test]
 
     print("[*] Training T-Learner (GradientBoostingClassifier)...")
     model = TLearner(
@@ -237,42 +233,50 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
     )
     model.fit(X_train, y_train, t_train)
 
-    val_uplift = model.predict_uplift(X_val)
-    qini = qini_bootstrap_interval(y_val, val_uplift, t_val, n_boot=200, seed=0)
-    qini_null = qini_random_interval(y_val, t_val, n_draws=200, seed=1)
-    u_at_30 = uplift_at_k(y_val, val_uplift, t_val, k=0.3)
+    cal_uplift = model.predict_uplift(X_cal)
+    test_uplift = model.predict_uplift(X_test)
+    cal_qini = qini_bootstrap_interval(y_cal, cal_uplift, t_cal, n_boot=200, seed=0)
+    decision = holdout_decision(float(cal_qini["low"]))
+    qini = qini_bootstrap_interval(y_test, test_uplift, t_test, n_boot=200, seed=1)
+    qini_null = qini_random_interval(y_test, t_test, n_draws=200, seed=2)
+    u_at_30 = uplift_at_k(y_test, test_uplift, t_test, k=0.3)
     print(
-        f"[*] Holdout Qini: {qini['point']:+.4f}  "
-        f"95% bootstrap [{qini['low']:+.4f}, {qini['high']:+.4f}] "
-        f"({qini['n_boot']} resamples of this one split)"
+        f"[*] Calibration Qini (sets the flag, n={len(idx_cal)}): {cal_qini['point']:+.4f}  "
+        f"95% [{cal_qini['low']:+.4f}, {cal_qini['high']:+.4f}]  "
+        f"ranking_supports_decision={decision['ranking_supports_decision']}"
     )
-    if qini["low"] < 0 < qini["high"]:
+    if not decision["ranking_supports_decision"]:
         print(
-            "[*] That interval contains 0. The point estimate on this split is not "
-            "separated from noise, so a score below -0.05 does not change the fare."
+            "[*] The calibration lower bound is not above 0, so a score below "
+            "-0.05 does not change the fare."
         )
     print(
-        f"[*] Random-score Qini: mean {qini_null['mean']:+.4f}  "
+        f"[*] Untouched test Qini (n={len(idx_test)}): {qini['point']:+.4f}  "
+        f"95% [{qini['low']:+.4f}, {qini['high']:+.4f}] "
+        f"({qini['n_boot']} resamples)"
+    )
+    print(
+        f"[*] Random-score Qini on the test: mean {qini_null['mean']:+.4f}  "
         f"95% [{qini_null['low']:+.4f}, {qini_null['high']:+.4f}] "
         f"over {qini_null['n_draws']} draws. One draw is not a null."
     )
-    print(f"[*] Holdout Uplift@30%: {u_at_30:+.4f}")
+    print(f"[*] Untouched test Uplift@30%: {u_at_30:+.4f}")
     print(f"[*] Decision threshold: ±{threshold}")
     calibration = summarize_calibration(
-        df["segment"].to_numpy()[idx_val],
-        df["true_uplift"].to_numpy()[idx_val],
-        val_uplift,
+        df["segment"].to_numpy()[idx_test],
+        df["true_uplift"].to_numpy()[idx_test],
+        test_uplift,
     )
-    print("[*] Calibration of the mean score against the planted effect:")
+    print("[*] Mean score against the planted effect, on the untouched test:")
     print(format_calibration(calibration))
 
     try:
         scenarios = pick_honest_scenarios(
-            X_val,
-            val_uplift,
+            X_test,
+            test_uplift,
             FEATURE_COLS,
             threshold=threshold,
-            true_uplift=df["true_uplift"].to_numpy()[idx_val],
+            true_uplift=df["true_uplift"].to_numpy()[idx_test],
         )
         assert_scenario_honesty(scenarios, threshold=threshold)
     except (RuntimeError, AssertionError) as exc:
@@ -294,7 +298,9 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
                 "qini_low": float(qini["low"]),
                 "qini_high": float(qini["high"]),
                 "uplift_at_k": float(u_at_30),
-                **holdout_decision(float(qini["low"])),
+                "calibration_qini_low": float(cal_qini["low"]),
+                "calibration_qini_high": float(cal_qini["high"]),
+                **decision,
             },
             "uplift_threshold": float(threshold),
         },
@@ -303,7 +309,7 @@ def run_demo(source: str = "synthetic", threshold: float = DEFAULT_THRESHOLD) ->
     print(f"[*] Saved artifact: {artifact_path}")
 
     print(
-        "\n### Extreme holdout scores\n"
+        "\n### Extreme scores on the untouched test\n"
         "The planted value on the row is the segment constant, not a target the\n"
         "row was chosen to match. A large gap is miscalibration.\n"
     )

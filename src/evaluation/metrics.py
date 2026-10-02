@@ -242,7 +242,8 @@ def holdout_decision(
 ) -> dict[str, float | str | bool | None]:
     """Decide, at training time, whether scores may change a fare.
 
-    The flag is true only when the holdout Qini lower bound is above zero.
+    Pass the Qini lower bound from the calibration slice, not from the untouched test.
+    The flag is true only when that bound is above zero.
     A false-override rate is stored when it is passed, but it does not affect
     the flag until a maximum is passed too. That maximum is not set yet.
     """
@@ -269,6 +270,43 @@ def read_ranking_supports_decision(metrics: dict | None) -> bool:
     if not isinstance(metrics, dict):
         return False
     return metrics.get("ranking_supports_decision") is True
+
+
+def split_train_calibration_test(
+    n: int,
+    treatment: np.ndarray,
+    *,
+    random_state: int = 42,
+    holdout_size: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Train, then split the holdout into a calibration slice and an untouched test.
+
+    The decision flag uses only the calibration slice. Reported Qini uses only
+    the test slice. The two slices are the same size and do not overlap.
+    """
+    from sklearn.model_selection import train_test_split
+
+    treatment = np.asarray(treatment).ravel()
+    indices = np.arange(n)
+    if len(treatment) != n:
+        raise ValueError("treatment length must equal n")
+    train_idx, hold_idx = train_test_split(
+        indices,
+        test_size=holdout_size,
+        random_state=random_state,
+        stratify=treatment,
+    )
+    cal_idx, test_idx = train_test_split(
+        hold_idx,
+        test_size=0.5,
+        random_state=random_state,
+        stratify=treatment[hold_idx],
+    )
+    return (
+        np.asarray(train_idx),
+        np.asarray(cal_idx),
+        np.asarray(test_idx),
+    )
 
 
 def qini_bootstrap_interval(

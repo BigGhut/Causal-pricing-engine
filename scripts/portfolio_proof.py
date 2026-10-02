@@ -30,10 +30,7 @@ if str(_ROOT) not in sys.path:
 
 import httpx
 import joblib
-import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
-
 from scripts.demo import (
     DEFAULT_THRESHOLD,
     FEATURE_COLS,
@@ -46,6 +43,7 @@ from src.evaluation.metrics import (
     qini_bootstrap_interval,
     qini_random_interval,
     read_ranking_supports_decision,
+    split_train_calibration_test,
     uplift_at_k,
 )
 from src.causal.uplift_models import TLearner
@@ -94,31 +92,37 @@ def _start_cpe() -> subprocess.Popen:
 
 def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, Any]]:
     df = generate_uplift_dataset(n=3000, random_state=42)
-    idx = np.arange(len(df))
-    idx_tr, idx_va = train_test_split(
-        idx, test_size=0.3, random_state=42, stratify=df["treatment"].to_numpy()
-    )
+    treatment = df["treatment"].to_numpy(dtype=int)
+    idx_tr, idx_cal, idx_te = split_train_calibration_test(len(df), treatment, random_state=42)
     X = df[FEATURE_COLS].to_numpy(dtype=float)
     y = df["accepted"].to_numpy(dtype=int)
-    t = df["treatment"].to_numpy(dtype=int)
-    X_tr, X_va = X[idx_tr], X[idx_va]
-    y_tr, y_va = y[idx_tr], y[idx_va]
-    t_tr, t_va = t[idx_tr], t[idx_va]
+    X_tr, y_tr, t_tr = X[idx_tr], y[idx_tr], treatment[idx_tr]
+    X_cal, y_cal, t_cal = X[idx_cal], y[idx_cal], treatment[idx_cal]
+    X_te, y_te, t_te = X[idx_te], y[idx_te], treatment[idx_te]
     model = TLearner(
         base_estimator=GradientBoostingClassifier(
             n_estimators=50, max_depth=3, random_state=42
         )
     )
     model.fit(X_tr, y_tr, t_tr)
-    u_va = model.predict_uplift(X_va)
-    qini = qini_bootstrap_interval(y_va, u_va, t_va, n_boot=200, seed=0)
-    qini_null = qini_random_interval(y_va, t_va, n_draws=200, seed=1)
-    calibration = summarize_calibration(
-        df["segment"].to_numpy()[idx_va],
-        df["true_uplift"].to_numpy()[idx_va],
-        u_va,
+    u_cal = model.predict_uplift(X_cal)
+    u_te = model.predict_uplift(X_te)
+    cal_qini = qini_bootstrap_interval(y_cal, u_cal, t_cal, n_boot=200, seed=0)
+    decision = holdout_decision(float(cal_qini["low"]))
+    qini = qini_bootstrap_interval(y_te, u_te, t_te, n_boot=200, seed=1)
+    qini_null = qini_random_interval(y_te, t_te, n_draws=200, seed=2)
+    segment_fit = summarize_calibration(
+        df["segment"].to_numpy()[idx_te],
+        df["true_uplift"].to_numpy()[idx_te],
+        u_te,
     )
     metrics = {
+        "calibration_n": int(len(idx_cal)),
+        "calibration_qini": float(cal_qini["point"]),
+        "calibration_qini_low": float(cal_qini["low"]),
+        "calibration_qini_high": float(cal_qini["high"]),
+        "calibration_qini_boot": int(cal_qini["n_boot"]),
+        "test_n": int(len(idx_te)),
         "qini_auc": float(qini["point"]),
         "qini_low": float(qini["low"]),
         "qini_high": float(qini["high"]),
@@ -127,16 +131,16 @@ def train_and_pick(threshold: float) -> tuple[dict[str, Any], list, dict[str, An
         "qini_random_low": float(qini_null["low"]),
         "qini_random_high": float(qini_null["high"]),
         "qini_random_draws": int(qini_null["n_draws"]),
-        "uplift_at_k": float(uplift_at_k(y_va, u_va, t_va, k=0.3)),
-        "calibration": calibration,
-        **holdout_decision(float(qini["low"])),
+        "uplift_at_k": float(uplift_at_k(y_te, u_te, t_te, k=0.3)),
+        "calibration": segment_fit,
+        **decision,
     }
     scenarios = pick_honest_scenarios(
-        X_va,
-        u_va,
+        X_te,
+        u_te,
         FEATURE_COLS,
         threshold=threshold,
-        true_uplift=df["true_uplift"].to_numpy()[idx_va],
+        true_uplift=df["true_uplift"].to_numpy()[idx_te],
     )
     assert_scenario_honesty(scenarios, threshold=threshold)
 
@@ -198,7 +202,14 @@ def run_proof(with_dpe: bool = False, threshold: float = DEFAULT_THRESHOLD) -> i
     print("[1] Train + honest scenario pick (synthetic HTE)...")
     payload, scenarios, metrics = train_and_pick(threshold)
     print(
-        f"    Qini {metrics['qini_auc']:+.4f} "
+        f"    Calibration n={metrics['calibration_n']} "
+        f"Qini {metrics['calibration_qini']:+.4f} "
+        f"95% [{metrics['calibration_qini_low']:+.4f}, {metrics['calibration_qini_high']:+.4f}] "
+        f"flag={metrics['ranking_supports_decision']}"
+    )
+    print(
+        f"    Untouched test n={metrics['test_n']} "
+        f"Qini {metrics['qini_auc']:+.4f} "
         f"95% [{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]  "
         f"Uplift@30%={metrics['uplift_at_k']:+.4f}"
     )
@@ -342,26 +353,31 @@ def _write_evidence(
         "- Treatment: additive surcharge versus the base fare. Outcome: driver accepts.",
         "- Features: `distance_km`, `duration_sec`, `hour_of_day`, `past_trips`, `avg_surge`. "
         "`price` and `surge_bonus` are not features.",
-        f"- Holdout Qini: `{metrics['qini_auc']:+.4f}`, "
-        f"95% bootstrap `[{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]` "
-        f"on {metrics['qini_boot']} resamples of this one split."
-        + (
-            " The interval contains 0, so the point estimate on this split is not separated from noise. "
-            "DPE does not drop the surcharge at -0.05 for this model: that cut would follow noise."
-            if metrics["qini_low"] < 0 < metrics["qini_high"]
-            else ""
+        f"- Calibration slice, n=`{metrics['calibration_n']}`: Qini `{metrics['calibration_qini']:+.4f}`, "
+        f"95% bootstrap `[{metrics['calibration_qini_low']:+.4f}, {metrics['calibration_qini_high']:+.4f}]` "
+        f"on {metrics['calibration_qini_boot']} resamples. "
+        f"This slice alone sets `ranking_supports_decision="
+        f"{str(metrics['ranking_supports_decision']).lower()}`.",
+        (
+            "- The calibration interval contains 0, so the flag is false and DPE does not "
+            "drop the surcharge at -0.05. That cut would follow noise."
+            if metrics["calibration_qini_low"] < 0 < metrics["calibration_qini_high"]
+            else "- The calibration interval does not contain 0."
         ),
-        f"- Random-score Qini: mean `{metrics['qini_random_mean']:+.4f}`, "
+        f"- Untouched test, n=`{metrics['test_n']}`: Qini `{metrics['qini_auc']:+.4f}`, "
+        f"95% bootstrap `[{metrics['qini_low']:+.4f}, {metrics['qini_high']:+.4f}]` "
+        f"on {metrics['qini_boot']} resamples. This slice did not set the flag.",
+        f"- Random-score Qini on the untouched test: mean `{metrics['qini_random_mean']:+.4f}`, "
         f"95% `[{metrics['qini_random_low']:+.4f}, {metrics['qini_random_high']:+.4f}]` "
         f"over {metrics['qini_random_draws']} draws. One random draw is not a null.",
-        f"- Holdout Uplift@30%: `{metrics['uplift_at_k']:+.4f}`",
+        f"- Untouched-test Uplift@30%: `{metrics['uplift_at_k']:+.4f}`",
         f"- CPE `/health`: `{json.dumps(health, ensure_ascii=False)}`",
         "",
-        "## Calibration",
+        "## Segment means on the untouched test",
         "",
-        "The planted cuts sit on columns the model receives. The mean score in a",
-        "segment is the calibration check. The rows below are the extreme scores",
-        "on the holdout, so their τ̂ is not the segment mean and is not a success",
+        "The planted cuts sit on columns the model receives. The means below are",
+        "on the untouched test. The rows further down are extreme scores on that",
+        "same test, so their τ̂ is not the segment mean and is not a success",
         "metric by itself.",
         "",
         "```text",
@@ -370,8 +386,9 @@ def _write_evidence(
         "",
         "## Extreme scores → live CPE → DPE policy",
         "",
-        "DPE applies this only on an additive hour that names a driver: "
-        "`if uplift_score < -threshold → base fare, CAUSAL_NO_SURGE`.",
+        "DPE asks CPE only on an additive hour that names a driver. "
+        "It drops the surcharge only when the calibration flag is true and "
+        "`uplift_score < -threshold`. The rows here are the untouched test.",
         "",
     ]
     for row in rows:
@@ -380,7 +397,7 @@ def _write_evidence(
         planted = row.get("planted_uplift")
         planted_text = "n/a" if planted is None else f"{planted:+.2f}"
         lines.append(
-            f"- Offline τ̂ (extreme holdout row): `{row['offline_uplift']:+.4f}`. "
+            f"- Offline τ̂ (extreme untouched-test row): `{row['offline_uplift']:+.4f}`. "
             f"Planted effect on this same row: `{planted_text}`."
         )
         if planted is not None and abs(float(planted)) > 1e-9:

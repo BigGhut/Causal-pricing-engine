@@ -241,6 +241,22 @@ def test_qini_and_uplift_at_k_on_labeled_data():
     assert qini > qini_random - 0.05
 
 
+def test_holdout_splits_into_disjoint_calibration_and_test():
+    from src.evaluation.metrics import split_train_calibration_test
+
+    treatment = np.array([0, 1] * 200)
+    train_idx, cal_idx, test_idx = split_train_calibration_test(
+        len(treatment), treatment, random_state=42
+    )
+    assert len(set(train_idx) & set(cal_idx)) == 0
+    assert len(set(train_idx) & set(test_idx)) == 0
+    assert len(set(cal_idx) & set(test_idx)) == 0
+    assert len(train_idx) + len(cal_idx) + len(test_idx) == len(treatment)
+    assert abs(len(cal_idx) - len(test_idx)) <= 1
+    assert set(treatment[cal_idx]) == {0, 1}
+    assert set(treatment[test_idx]) == {0, 1}
+
+
 def test_ranking_flag_is_fixed_at_training_and_only_read_at_serve():
     from src.evaluation.metrics import holdout_decision, read_ranking_supports_decision
 
